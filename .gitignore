@@ -1,0 +1,29 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Training artifacts — keep summaries/csv but skip heavy .pt checkpoints
+checkpoints/**/*.pt
+checkpoints/**/*.ckpt
+runs/
+logs/
+wandb/
+*.log
+
+# Data cache
+data/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Notebook
+.ipynb_checkpoints/

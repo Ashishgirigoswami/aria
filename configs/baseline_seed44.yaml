@@ -1,0 +1,41 @@
+# Ablation: baseline with seed 44
+model:
+  name: baseline
+  vocab_size: 128
+  d_model: 256
+  n_layers: 6
+  n_heads: 4
+  d_head: 64
+  d_ff: 832
+  max_seq_len: 512
+  dropout: 0.0
+  rope_base: 10000.0
+  tie_weights: true
+
+data:
+  dataset: tinyshakespeare
+  cache_dir: ./data
+  seq_len: 256
+  train_split: 0.9
+
+training:
+  batch_size: 16
+  grad_accum_steps: 2
+  max_steps: 3000
+  eval_every: 200
+  eval_iters: 50
+  warmup_steps: 100
+  lr: 3.0e-4
+  min_lr: 3.0e-5
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+  amp: false
+  device: auto
+  seed: 44
+
+logging:
+  run_name: baseline_seed44
+  checkpoint_dir: ./checkpoints/baseline_seed44
+  log_every: 20
