@@ -41,13 +41,31 @@ import torch.nn.functional as F
 
 @dataclass
 class PasskeyConfig:
-    """Configuration for the synthetic passkey retrieval task."""
+    """Configuration for the synthetic passkey retrieval task.
+
+    Vocab slicing notes — important for a meaningful metric:
+
+    - ``filler_range`` and ``passkey_range`` both draw from the COMMON region
+      of the BPE vocabulary. GPT-2's last ~10k tokens are Unicode fragments
+      and rare byte pairs that wikitext-trained models assign ~0 probability
+      to; drawing passkeys from that region produces losses *above* the
+      uniform-prediction floor because the model's training prior actively
+      fights the correct answer. Stick to indices < ~30_000 for natural tokens.
+
+    - ``run_control``, if True, additionally measures loss at the same
+      positions with a RANDOM unseen token substituted for the second passkey.
+      The retrieval signal is the delta:  control_loss - retrieval_loss.
+      This isolates in-context induction from the model's generic token prior.
+    """
 
     context_lengths: tuple[int, ...] = (128, 256, 512, 1024)
     depths: tuple[float, ...] = (0.1, 0.5, 0.9)  # where in the context the passkey is placed
     passkey_len: int = 8                          # how many tokens the passkey spans
     n_trials: int = 16                            # samples per (length, depth) cell
     seed: int = 20260415                          # deterministic task construction
+    filler_range: tuple[int, int] = (0, 30_000)   # BPE ids for filler tokens
+    passkey_range: tuple[int, int] = (0, 30_000)  # BPE ids for passkey tokens
+    run_control: bool = True                      # also measure the no-retrieval baseline
 
 
 def build_passkey_batch(
@@ -56,59 +74,67 @@ def build_passkey_batch(
     context_length: int,
     depth: float,
     rng: np.random.Generator,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build a batch of passkey retrieval samples at one (length, depth) cell.
 
     Returns:
-        input_ids: (n_trials, context_length) int64
-        target_ids: (n_trials, context_length) int64 — shifted by one, with -100
-            on every position EXCEPT the final ``passkey_len`` tokens, so that
-            ``F.cross_entropy(ignore_index=-100)`` computes loss only on the
-            recalled passkey.
-        passkey_positions: (n_trials,) int64 — start index of the first passkey
-            for diagnostics.
+        input_retrieve: (n_trials, context_length) int64 — the passkey is
+            written at BOTH the first_start and second_start positions, so
+            the model can retrieve it in-context.
+        input_control:  (n_trials, context_length) int64 — identical filler
+            except the second_start position is filled with a FRESH random
+            token that does not appear earlier in the sequence. Provides the
+            no-retrieval baseline.
+        target_ids:     (n_trials, context_length) int64 — shifted-by-one
+            targets masked to only score the passkey_len tokens at the
+            second_start region. Shared between both inputs (the "correct"
+            answer is always the retrieval passkey; loss on ``input_control``
+            measures how well the model predicts that passkey without having
+            seen it).
+        passkey_positions: (n_trials,) int64 — diagnostic.
     """
     n = cfg.n_trials
     k = cfg.passkey_len
-    # Need room for: first_passkey (k) + middle_filler + second_passkey (k).
-    # The second passkey must end at position context_length - 1.
-    # The first passkey starts at int(depth * (context_length - 2*k)).
     usable = context_length - 2 * k
     assert usable > 0, f"context_length {context_length} too short for passkey_len {k}"
     first_start = int(depth * usable)
     second_start = context_length - k
 
-    # Random filler — draw from a safe subset of the vocab to avoid special tokens.
-    # GPT-2 BPE vocab is 50257; token 0 is '!', token 50256 is '<|endoftext|>'.
-    # Avoid the last 256 tokens to dodge reserved/special territory.
-    filler_hi = min(vocab_size, 50000)
-    input_ids = rng.integers(0, filler_hi, size=(n, context_length), dtype=np.int64)
+    f_lo, f_hi = cfg.filler_range
+    p_lo, p_hi = cfg.passkey_range
+    f_hi = min(f_hi, vocab_size)
+    p_hi = min(p_hi, vocab_size)
+    assert f_lo < f_hi and p_lo < p_hi
 
-    # Draw passkey tokens from a DIFFERENT slice so they are "rare" relative to filler,
-    # making accidental prediction unlikely.
-    passkey_lo = max(0, vocab_size - 10_000)
-    passkey_hi = vocab_size
-    passkeys = rng.integers(passkey_lo, passkey_hi, size=(n, k), dtype=np.int64)
+    # Base filler sequence.
+    base = rng.integers(f_lo, f_hi, size=(n, context_length), dtype=np.int64)
 
-    # Write the passkey into both positions.
-    input_ids[:, first_start : first_start + k] = passkeys
-    input_ids[:, second_start : second_start + k] = passkeys
+    # Passkey tokens — drawn from the natural vocab range.
+    passkeys = rng.integers(p_lo, p_hi, size=(n, k), dtype=np.int64)
 
-    # Build target_ids: shift by one for next-token prediction, then mask out
-    # everything except the second passkey's interior.
-    target_ids = np.full_like(input_ids, fill_value=-100)
-    # The token at position p is predicted FROM the token at position p-1,
-    # so the input position that produces "passkey[i]" is second_start + i - 1.
-    # We want predictions at input positions [second_start-1 .. second_start+k-2],
-    # predicting targets [passkey[0] .. passkey[k-1]].
-    # Equivalently: target_ids[:, second_start-1 : second_start+k-1] = passkeys.
+    # Control tokens — different random tokens at the second_start position,
+    # used only in ``input_control``. This gives us a "no prior occurrence"
+    # baseline per sample.
+    control_tokens = rng.integers(p_lo, p_hi, size=(n, k), dtype=np.int64)
+
+    input_retrieve = base.copy()
+    input_retrieve[:, first_start : first_start + k] = passkeys
+    input_retrieve[:, second_start : second_start + k] = passkeys
+
+    input_control = base.copy()
+    input_control[:, first_start : first_start + k] = passkeys
+    input_control[:, second_start : second_start + k] = control_tokens
+
+    # Target: always the retrieval passkey at the second_start position.
+    target_ids = np.full_like(base, fill_value=-100)
     tgt_start = second_start - 1
     tgt_end = second_start + k - 1
     assert tgt_end <= context_length - 1
     target_ids[:, tgt_start:tgt_end] = passkeys
 
     return (
-        torch.from_numpy(input_ids),
+        torch.from_numpy(input_retrieve),
+        torch.from_numpy(input_control),
         torch.from_numpy(target_ids),
         torch.from_numpy(np.full(n, first_start, dtype=np.int64)),
     )
@@ -152,35 +178,60 @@ def passkey_eval(
     all_top1: list[float] = []
 
     max_seq_len = getattr(model, "max_seq_len", None)
+    all_control: list[float] = []
+    all_deltas: list[float] = []
+
+    def _masked_ce_and_top1(x: torch.Tensor, y: torch.Tensor) -> tuple[float, float]:
+        logits, _ = model(x)
+        V = logits.size(-1)
+        flat_logits = logits.view(-1, V)
+        flat_targets = y.view(-1)
+        mask = flat_targets != -100
+        ce = F.cross_entropy(
+            flat_logits[mask], flat_targets[mask], reduction="mean"
+        ).item()
+        preds = flat_logits[mask].argmax(dim=-1)
+        top1 = (preds == flat_targets[mask]).float().mean().item()
+        return ce, top1
 
     for L in cfg.context_lengths:
         if max_seq_len is not None and L > max_seq_len:
             continue
         grid[str(L)] = {}
         for d in cfg.depths:
-            x, y, _ = build_passkey_batch(cfg, vocab_size, L, d, rng)
-            x = x.to(device)
+            xr, xc, y, _ = build_passkey_batch(cfg, vocab_size, L, d, rng)
+            xr = xr.to(device)
+            xc = xc.to(device)
             y = y.to(device)
 
-            logits, _ = model(x)  # ignore the built-in loss; we need masked CE
-            # Flatten and compute masked cross-entropy on the passkey positions.
-            V = logits.size(-1)
-            flat_logits = logits.view(-1, V)
-            flat_targets = y.view(-1)
-            mask = flat_targets != -100
-            if not mask.any():
-                continue
-            ce = F.cross_entropy(
-                flat_logits[mask], flat_targets[mask], reduction="mean"
-            ).item()
+            retrieval_ce, retrieval_top1 = _masked_ce_and_top1(xr, y)
+            cell: dict[str, float] = {
+                "loss": retrieval_ce,
+                "top1_accuracy": retrieval_top1,
+            }
 
-            # Top-1 accuracy on passkey positions.
-            preds = flat_logits[mask].argmax(dim=-1)
-            top1 = (preds == flat_targets[mask]).float().mean().item()
+            if cfg.run_control:
+                control_ce, _ = _masked_ce_and_top1(xc, y)
+                # Delta > 0 means retrieval helps: the model predicts the
+                # passkey more confidently when it has seen it earlier in
+                # context than when it has not. This is the induction signal.
+                delta = control_ce - retrieval_ce
+                cell["control_loss"] = control_ce
+                cell["retrieval_delta"] = delta
+                all_control.append(control_ce)
+                all_deltas.append(delta)
 
-            grid[str(L)][str(d)] = {"loss": ce, "top1_accuracy": top1}
-            all_losses.append(ce)
-            all_top1.append(top1)
+            grid[str(L)][str(d)] = cell
+            all_losses.append(retrieval_ce)
+            all_top1.append(retrieval_top1)
+
+    summary: dict[str, float] = {
+        "mean_retrieval_loss": float(np.mean(all_losses)) if all_losses else float("nan"),
+        "mean_top1": float(np.mean(all_top1)) if all_top1 else float("nan"),
+    }
+    if cfg.run_control and all_control:
+        summary["mean_control_loss"] = float(np.mean(all_control))
+        summary["mean_retrieval_delta"] = float(np.mean(all_deltas))
 
     return {
         "config": {
@@ -190,12 +241,12 @@ def passkey_eval(
             "n_trials": cfg.n_trials,
             "seed": cfg.seed,
             "vocab_size": vocab_size,
+            "filler_range": list(cfg.filler_range),
+            "passkey_range": list(cfg.passkey_range),
+            "run_control": cfg.run_control,
         },
         "grid": grid,
-        "summary": {
-            "mean_loss": float(np.mean(all_losses)) if all_losses else float("nan"),
-            "mean_top1": float(np.mean(all_top1)) if all_top1 else float("nan"),
-        },
+        "summary": summary,
     }
 
 
