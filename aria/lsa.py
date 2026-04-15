@@ -65,11 +65,18 @@ class LSAAttention(nn.Module):
         d_kv_latent: Low-rank KV compression dim (<< d_model).
         d_state: SSM state dim.
         dropout: Attention dropout.
+        window_size: If set, restrict local attention to a sliding window of
+            W recent tokens (in addition to the causal mask). When None the
+            layer uses full causal attention over up-projected K/V, matching
+            Phase 0 behavior. Setting W makes the per-layer KV cache bounded
+            to O(W * d_kv_latent + d_state) regardless of sequence length.
     """
 
     def __init__(self, d_model: int, n_heads: int,
-                 d_kv_latent: int, d_state: int, dropout: float = 0.0):
+                 d_kv_latent: int, d_state: int, dropout: float = 0.0,
+                 window_size: int | None = None):
         super().__init__()
+        self.window_size = window_size
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
         self.d_model = d_model
         self.n_heads = n_heads
@@ -166,6 +173,14 @@ class LSAAttention(nn.Module):
         # Local causal attention scores: (B, H, T, T)
         scores_local = torch.matmul(q, k_local.transpose(-2, -1)) * scale
         causal_mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
+        if self.window_size is not None:
+            # Sliding window: position i may only attend to j in (i - W, i].
+            # Combined with the causal mask below this gives j in [max(0, i-W+1), i].
+            window_mask = torch.triu(
+                torch.ones(T, T, device=x.device, dtype=torch.bool),
+                diagonal=-(self.window_size - 1),
+            )
+            causal_mask = causal_mask & window_mask
         scores_local = scores_local.masked_fill(~causal_mask.view(1, 1, T, T), float('-inf'))
 
         # State attention scores: each position attends to its OWN state.
@@ -194,10 +209,12 @@ class LSABlock(nn.Module):
     """Pre-LN block: RMSNorm -> LSA -> residual -> RMSNorm -> SwiGLU -> residual."""
 
     def __init__(self, d_model: int, n_heads: int, d_ff: int,
-                 d_kv_latent: int, d_state: int, dropout: float = 0.0):
+                 d_kv_latent: int, d_state: int, dropout: float = 0.0,
+                 window_size: int | None = None):
         super().__init__()
         self.norm1 = RMSNorm(d_model)
-        self.attn = LSAAttention(d_model, n_heads, d_kv_latent, d_state, dropout)
+        self.attn = LSAAttention(d_model, n_heads, d_kv_latent, d_state, dropout,
+                                 window_size=window_size)
         self.norm2 = RMSNorm(d_model)
         self.mlp = SwiGLU(d_model, d_ff, dropout)
 
@@ -215,7 +232,8 @@ class LSALanguageModel(nn.Module):
                  n_heads: int, d_head: int, d_ff: int,
                  d_kv_latent: int, d_state: int,
                  max_seq_len: int, dropout: float = 0.0,
-                 rope_base: float = 10000.0, tie_weights: bool = True):
+                 rope_base: float = 10000.0, tie_weights: bool = True,
+                 window_size: int | None = None):
         super().__init__()
         assert d_model == n_heads * d_head, \
             f"d_model ({d_model}) must equal n_heads ({n_heads}) * d_head ({d_head})"
@@ -224,10 +242,12 @@ class LSALanguageModel(nn.Module):
         self.d_model = d_model
         self.n_layers = n_layers
         self.max_seq_len = max_seq_len
+        self.window_size = window_size
 
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.blocks = nn.ModuleList([
-            LSABlock(d_model, n_heads, d_ff, d_kv_latent, d_state, dropout)
+            LSABlock(d_model, n_heads, d_ff, d_kv_latent, d_state, dropout,
+                     window_size=window_size)
             for _ in range(n_layers)
         ])
         self.norm_f = RMSNorm(d_model)
