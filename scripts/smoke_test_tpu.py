@@ -31,7 +31,8 @@ from aria.lsa import LSALanguageModel
 from aria.baseline import BaselineLanguageModel
 from aria.nn_utils import count_parameters
 
-import torch_xla.core.xla_model as xm
+import torch_xla
+import torch_xla.core.xla_model as xm  # still used for optimizer_step
 
 
 def smoke(model: torch.nn.Module, name: str, device: torch.device,
@@ -49,7 +50,7 @@ def smoke(model: torch.nn.Module, name: str, device: torch.device,
     logits, loss = model(x, y)
     loss.backward()
     xm.optimizer_step(opt)
-    xm.mark_step()
+    torch_xla.sync()
     loss1 = loss.item()
     print(f"step 1 | logits shape {tuple(logits.shape)} | loss {loss1:.4f}")
     assert logits.shape == (batch_size, seq_len, vocab_size), (
@@ -62,7 +63,7 @@ def smoke(model: torch.nn.Module, name: str, device: torch.device,
     logits2, loss2 = model(x, y)
     loss2.backward()
     xm.optimizer_step(opt)
-    xm.mark_step()
+    torch_xla.sync()
     loss2_val = loss2.item()
     print(f"step 2 | loss {loss2_val:.4f}")
     assert loss2_val < loss1 + 1e-3, (
@@ -72,9 +73,12 @@ def smoke(model: torch.nn.Module, name: str, device: torch.device,
 
 
 def main() -> None:
-    device = xm.xla_device()
+    device = torch_xla.device()
     print(f"XLA device: {device}")
-    print(f"device kind: {xm.xla_device_hw(device)}")
+    try:
+        print(f"device kind: {xm.xla_device_hw(device)}")
+    except Exception:
+        pass  # xla_device_hw is deprecated/removed in newer torch_xla
 
     vocab = 65
     lsa = LSALanguageModel(

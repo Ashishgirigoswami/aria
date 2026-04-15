@@ -29,6 +29,8 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
+import torch_xla
+
 # torch_xla is optional at import time so the file still parses on machines
 # without it (the GPU trainer remains usable).
 try:
@@ -108,7 +110,7 @@ class XLATrainer:
         self.val_sampler = val_sampler
         self.cfg = config
 
-        self.device = xm.xla_device()
+        self.device = torch_xla.device()
         self.model.to(self.device)
 
         param_groups = split_weight_decay_params(model, config.weight_decay)
@@ -130,7 +132,7 @@ class XLATrainer:
             x, y = self.val_sampler.sample()
             x, y = x.to(self.device), y.to(self.device)
             _, loss = self.model(x, y)
-            xm.mark_step()
+            torch_xla.sync()
             losses.append(loss.item())
         self.model.train()
         mean_loss = sum(losses) / len(losses)
@@ -181,7 +183,7 @@ class XLATrainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
 
         xm.optimizer_step(self.optimizer)  # single-core: barrier=True implicit
-        xm.mark_step()
+        torch_xla.sync()
         return total_loss / self.cfg.grad_accum_steps
 
     def fit(self) -> dict[str, Any]:

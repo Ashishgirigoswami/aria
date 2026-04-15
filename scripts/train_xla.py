@@ -88,7 +88,7 @@ def main() -> None:
     print(f"Vocab size: {tokenizer.vocab_size}")
     print(f"Train samples: {len(train_ds):,}, Val samples: {len(val_ds):,}")
 
-    device = xm.xla_device()
+    device = torch_xla.device()
     train_sampler = RandomWindowSampler(train_ds, cfg["training"]["batch_size"], device)
     val_sampler = RandomWindowSampler(val_ds, cfg["training"]["batch_size"], device)
 
