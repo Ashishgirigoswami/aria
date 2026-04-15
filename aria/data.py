@@ -110,6 +110,33 @@ class BPETokenizer:
     def encode(self, text: str) -> list[int]:
         return self._enc.encode_ordinary(text)
 
+    def encode_chunked(self, text: str, chunk_chars: int = 1_000_000) -> list[int]:
+        """Parallel tokenize a large blob by splitting on newlines into ~1MB chunks.
+
+        Uses encode_ordinary_batch which releases the GIL and runs across cores.
+        Roughly 10-30x faster than a single encode_ordinary call on 100M+ char inputs.
+        """
+        chunks: list[str] = []
+        start = 0
+        n = len(text)
+        while start < n:
+            end = min(start + chunk_chars, n)
+            if end < n:
+                nl = text.rfind("\n", start, end)
+                if nl > start:
+                    end = nl + 1
+            chunks.append(text[start:end])
+            start = end
+        ids: list[int] = []
+        batch_size = 64
+        for i in range(0, len(chunks), batch_size):
+            batch = chunks[i : i + batch_size]
+            for enc in self._enc.encode_ordinary_batch(batch):
+                ids.extend(enc)
+            done = min(i + batch_size, len(chunks))
+            print(f"  tokenized {done}/{len(chunks)} chunks", flush=True)
+        return ids
+
     def decode(self, ids: list[int]) -> str:
         return self._enc.decode(ids)
 
@@ -119,8 +146,8 @@ def _tokenize_to_binfile(text: str, tokenizer: BPETokenizer,
     """Tokenize a text blob once and memoize as an int32 binary file."""
     if out_path.exists():
         return np.fromfile(out_path, dtype=np.int32)
-    print(f"Tokenizing {len(text):,} chars -> {out_path}")
-    ids = tokenizer.encode(text)
+    print(f"Tokenizing {len(text):,} chars -> {out_path}", flush=True)
+    ids = tokenizer.encode_chunked(text) if len(text) > 2_000_000 else tokenizer.encode(text)
     arr = np.array(ids, dtype=np.int32)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     arr.tofile(out_path)
