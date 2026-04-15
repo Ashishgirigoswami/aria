@@ -1,0 +1,48 @@
+# Kaggle-fast LSA: 30M params, seq_len 512, 8k steps
+# Designed to fit one 9h Kaggle T4/P100 session end-to-end.
+# LSA's sequential SSM scan scales linearly with seq_len, so halving
+# context from 1024 -> 512 roughly halves wall time per step.
+model:
+  name: lsa
+  vocab_size: 50257
+  d_model: 384
+  n_layers: 6
+  n_heads: 6
+  d_head: 64
+  d_ff: 1024
+  d_kv_latent: 192
+  d_state: 192
+  max_seq_len: 512
+  dropout: 0.0
+  rope_base: 10000.0
+  tie_weights: true
+
+data:
+  dataset: wikitext-103
+  tokenizer: bpe
+  cache_dir: ./data
+  seq_len: 512
+  train_split: 0.95
+  max_train_tokens: 50000000
+
+training:
+  batch_size: 16
+  grad_accum_steps: 2             # effective batch 32
+  max_steps: 8000
+  eval_every: 400
+  eval_iters: 50
+  warmup_steps: 400
+  lr: 6.0e-4
+  min_lr: 6.0e-5
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+  amp: true
+  device: auto
+  seed: 42
+
+logging:
+  run_name: kaggle_lsa_fast_30m
+  checkpoint_dir: ./checkpoints/kaggle_lsa_fast_30m
+  log_every: 50
