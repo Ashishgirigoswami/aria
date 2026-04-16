@@ -113,11 +113,11 @@ class XLATrainer:
         self.device = torch_xla.device()
         self.model.to(self.device)
 
-        # Re-tie weights after .to(device) — XLA can break Parameter sharing
-        # when moving to an XLA device, causing lm_head and token_emb to get
-        # independent copies. This doubles the embedding param count.
+        # Re-tie weights after .to(device) — XLA's .to() can break Parameter
+        # sharing, causing lm_head and token_emb to get independent copies.
+        # Unconditionally re-assign if the model was built with tie_weights.
         if hasattr(model, 'lm_head') and hasattr(model, 'token_emb'):
-            if model.lm_head.weight.data_ptr() != model.token_emb.weight.data_ptr():
+            if model.lm_head.weight is not model.token_emb.weight:
                 model.lm_head.weight = model.token_emb.weight
 
         param_groups = split_weight_decay_params(model, config.weight_decay)
