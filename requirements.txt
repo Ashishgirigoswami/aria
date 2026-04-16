@@ -5,3 +5,8 @@ numpy>=1.24
 # Optional: only needed for BPE / larger-corpus experiments (configs/kaggle_*)
 tiktoken>=0.5
 datasets>=2.14
+# Optional: Gated DeltaNet chunk kernel (GPU path for LSA v2).
+# Requires Triton + Linux + CUDA. Skip on CPU/TPU/Windows — lsa_v2.py
+# auto-detects and falls back to a pure-PyTorch chunked scan.
+# Pinned to 0.4.2 for reproducibility.
+fla-core==0.4.2

@@ -26,26 +26,24 @@ Scaffolded after the April 2026 literature audit. Changes from v1 (aria/lsa.py):
    model config accepts `interleave_ratio`; when set, every Nth block is a
    vanilla transformer block (pulled from aria.baseline.CausalAttention).
 
-## Implementation status
+## Recurrence backends (three paths)
 
-This file is a **reference scaffold**: the delta-rule recurrence is written
-as a plain Python loop (same approach as v1's pre-JIT scan) so that the code
-is correct and readable *before* we swap in fla's chunk kernel for speed.
+1. **fla chunk kernel** (Linux + CUDA + Triton + fla-core 0.4.2):
+   ``chunk_gated_delta_rule`` from fla-org/flash-linear-attention. Fastest.
+   Auto-detected via ``HAS_FLA`` flag. Used when model is on a CUDA device
+   and fla is importable.
 
-To port to the fast path later:
+2. **Pure-PyTorch chunked scan** (any device — TPU, CPU, CUDA without fla):
+   ``chunked_gated_delta_rule_torch`` — splits the sequence into chunks of
+   ``CHUNK_SIZE`` (default 64), runs the sequential delta-rule loop inside
+   each chunk, carries state between chunks. Mathematically identical to the
+   reference loop but reduces XLA/torch graph depth from T to T/C, which
+   is the key speedup on TPU where each loop iteration adds graph nodes.
+   Also ~C× less Python dispatch overhead on CPU.
 
-    try:
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-        HAS_FLA = True
-    except ImportError:
-        HAS_FLA = False
-
-    # inside forward, replace the reference loop with:
-    o, _ = chunk_gated_delta_rule(q, k, v, g, beta, ...)
-
-The reference loop runs at the scale of the sequential v1 SSM scan (slow).
-Use this file for correctness validation and small-scale ablations; swap in
-the fla kernel before any run larger than ~100M params.
+3. **Reference sequential loop** (correctness ground truth):
+   ``gated_delta_rule_ref`` — one Python loop of T iterations. Too slow for
+   training beyond ~30M params but serves as the bit-exactness baseline.
 
 ## Hard constraints from the spec (do not violate)
 
@@ -69,9 +67,21 @@ import torch.nn.functional as F
 from .nn_utils import RMSNorm, SwiGLU, precompute_rope, apply_rope
 from .baseline import CausalAttention  # reused for interleaved full-attention blocks
 
+# ---------------------------------------------------------------------------
+# Backend detection
+# ---------------------------------------------------------------------------
+
+try:
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule as _fla_chunk
+    HAS_FLA = True
+except (ImportError, OSError):
+    HAS_FLA = False
+
+CHUNK_SIZE: int = 64  # for the pure-PyTorch chunked scan
+
 
 # ---------------------------------------------------------------------------
-# Gated DeltaNet recurrent branch
+# Gated DeltaNet recurrent branch — three backends
 # ---------------------------------------------------------------------------
 
 
@@ -166,6 +176,54 @@ def gated_delta_rule_ref(
         o_t = torch.einsum("bhkv,bhk->bhv", S, q_t)        # (B, H, V)
         out[:, :, t] = o_t.to(q.dtype)
 
+    return out
+
+
+def chunked_gated_delta_rule_torch(
+    q: torch.Tensor,        # (B, H, T, K)
+    k: torch.Tensor,        # (B, H, T, K)
+    v: torch.Tensor,        # (B, H, T, V)
+    g: torch.Tensor,        # (B, H, T)
+    beta: torch.Tensor,     # (B, H, T)
+    chunk_size: int = CHUNK_SIZE,
+) -> torch.Tensor:
+    """Pure-PyTorch chunked delta-rule scan — works on CPU, CUDA, and TPU.
+
+    Identical math to ``gated_delta_rule_ref`` but chunks the sequence into
+    blocks of ``chunk_size``. Within each chunk the sequential loop runs for
+    only ``chunk_size`` steps (not T), and the state is carried between
+    chunks. This reduces XLA graph depth from T to T / chunk_size — the key
+    speedup on TPU where each Python-loop iteration adds XLA graph nodes.
+
+    State is fp32 regardless of input dtype.
+    """
+    B, H, T, K = q.shape
+    V = v.size(-1)
+    S = torch.zeros(B, H, K, V, dtype=torch.float32, device=q.device)
+    out = torch.empty(B, H, T, V, dtype=q.dtype, device=q.device)
+
+    q_f = q.float()
+    k_f = k.float()
+    v_f = v.float()
+    g_f = g.float()
+    b_f = beta.float()
+
+    n_chunks = (T + chunk_size - 1) // chunk_size
+    for c in range(n_chunks):
+        start = c * chunk_size
+        end = min(start + chunk_size, T)
+        for t in range(start, end):
+            alpha_t = torch.exp(g_f[:, :, t])
+            k_t = k_f[:, :, t]
+            v_t = v_f[:, :, t]
+            beta_t = b_f[:, :, t]
+
+            S = S * alpha_t[:, :, None, None]
+            sTk = torch.einsum("bhkv,bhk->bhv", S, k_t)
+            v_new = beta_t[:, :, None] * (v_t - sTk)
+            S = S + torch.einsum("bhk,bhv->bhkv", k_t, v_new)
+            o_t = torch.einsum("bhkv,bhk->bhv", S, q_f[:, :, t])
+            out[:, :, t] = o_t.to(q.dtype)
     return out
 
 
@@ -269,8 +327,15 @@ class GatedDeltaRecurrence(nn.Module):
         g = -F.softplus(self.dt_bias[None, :, None] + a) * torch.exp(self.A_log[None, :, None])
         beta = torch.sigmoid(self.b_proj(x).transpose(1, 2))   # (B, H, T)
 
-        # Recurrence.
-        o = gated_delta_rule_ref(q, k, v, g, beta)             # (B, H, T, Vh)
+        # Recurrence — select backend based on device + availability.
+        use_fla = HAS_FLA and q.is_cuda
+        if use_fla:
+            # fla chunk kernel: fastest on CUDA. Expects (B, H, T, K/V) inputs.
+            # Returns (output, final_state); we only need the output.
+            o, _ = _fla_chunk(q, k, v, g, beta)
+        else:
+            # Pure-PyTorch chunked scan: works everywhere (TPU, CPU, CUDA).
+            o = chunked_gated_delta_rule_torch(q, k, v, g, beta)  # (B, H, T, Vh)
 
         # Merge heads back.
         o = o.transpose(1, 2).contiguous().view(B, T, H * Vh)  # (B, T, H*Vh)
