@@ -153,22 +153,24 @@ class _GDNScanFunction(torch.autograd.Function):
                   v_f.permute(2,0,1,3), g_f.permute(2,0,1), b_f.permute(2,0,1))
             init_S = torch.zeros(B, H, K, V, dtype=torch.float32, device=q.device)
 
+            # Scan step returns single tensor (state) — avoids tuple autograd issues.
+            # We derive the output vectorized AFTER the scan: o_t = S_t^T q_t
             def fwd_step(S, x):
-                q_i, k_i, v_i, g_i, b_i = x
+                _, k_i, v_i, g_i, b_i = x  # q not needed in step
                 alpha = torch.exp(g_i)
                 S_pre = S * alpha[:, :, None, None]
                 sTk = (S_pre * k_i.unsqueeze(-1)).sum(-2)
                 v_new = b_i[:, :, None] * (v_i - sTk)
                 S_new = S_pre + k_i.unsqueeze(-1) * v_new.unsqueeze(-2)
-                o_i = (S_new * q_i.unsqueeze(-1)).sum(-2)
-                # Return both state and output — xla_scan saves output stack
-                return S_new, (S_new, o_i)
+                return S_new, S_new  # (carry, output) — both are state
 
-            _, (states, outputs) = xla_scan(fwd_step, init_S, xs)
-            # states: (T, B, H, K, V) — all intermediate states from one compiled iteration
-            # outputs: (T, B, H, V)
-            out = outputs.permute(1, 2, 0, 3).to(q.dtype)
-            states_saved = states  # (T, B, H, K, V) — save for backward
+            _, states = xla_scan(fwd_step, init_S, xs)
+            # states: (T, B, H, K, V) — all intermediate states
+            # Vectorized readout: o_t = S_t^T q_t → (B, H, T, V)
+            # states is (T, B, H, K, V), q_f is (B, H, T, K)
+            states_bhtkv = states.permute(1, 2, 0, 3, 4)  # (B, H, T, K, V)
+            out = (states_bhtkv * q_f.unsqueeze(-1)).sum(-2).to(q.dtype)  # (B, H, T, V)
+            states_saved = states  # keep time-first for backward
         else:
             S = torch.zeros(B, H, K, V, dtype=torch.float32, device=q.device)
             out = torch.empty(B, H, T, V, dtype=q.dtype, device=q.device)
