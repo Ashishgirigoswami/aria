@@ -184,53 +184,104 @@ def load_wikitext103(cache_dir: str | Path, max_train_tokens: int | None = None
 
 
 def load_fineweb_edu(cache_dir: str | Path, max_train_tokens: int | None = None,
-                     val_tokens: int = 500_000) -> tuple[str, str]:
-    """Load FineWeb-Edu via HuggingFace streaming.
+                     val_tokens: int = 500_000,
+                     subset: str = "sample-10BT",
+                     max_retries: int = 5) -> tuple[str, str]:
+    """Load FineWeb-Edu via HuggingFace streaming with retry + resume.
 
-    Streams from ``HuggingFaceFW/fineweb-edu`` (1.3T tokens total). Only
-    downloads as much text as needed for ``max_train_tokens`` (at ~4 chars/BPE
-    token). A small val split is carved from the end of the streamed data.
+    Streams from ``HuggingFaceFW/fineweb-edu``. On network errors retries
+    with exponential backoff up to ``max_retries`` times. Partial progress
+    is checkpointed to ``cache_dir/fineweb_partial.txt`` so an interrupted
+    download resumes where it left off on the next call.
 
-    FineWeb-Edu is the highest-quality filtered web corpus available (April
-    2026). 10% of its tokens match the performance of 350B unfiltered tokens.
+    ``subset`` options:
+      - "sample-10BT" (default): 10B tokens, good for 150M-1B training
+      - "sample-100BT": 100B tokens
+      - "sample-350BT": 350B tokens
+      - None: full 1.3T corpus (not recommended for streaming)
     """
-    from datasets import load_dataset  # lazy import
+    import time
+    from datasets import load_dataset
 
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # Use the "sample-10BT" subset for tractable downloads; full corpus is 1.3T
-    ds = load_dataset(
-        "HuggingFaceFW/fineweb-edu",
-        name="sample-10BT",
-        split="train",
-        streaming=True,
-        cache_dir=str(cache_dir),
-    )
-
-    char_budget = (max_train_tokens or 50_000_000) * 4  # ~4 chars per BPE token
+    char_budget = (max_train_tokens or 50_000_000) * 4
     val_char_budget = val_tokens * 4
+    target_chars = char_budget + val_char_budget
 
-    pieces: list[str] = []
-    total_chars = 0
-    for row in ds:
-        t = row.get("text", "")
-        if not t or len(t) < 50:
-            continue
-        pieces.append(t)
-        total_chars += len(t)
-        if total_chars >= char_budget + val_char_budget:
+    # Resume from partial checkpoint if present.
+    partial_path = cache_dir / f"fineweb_partial_{subset}.txt"
+    all_text = ""
+    if partial_path.exists():
+        all_text = partial_path.read_text(encoding="utf-8", errors="ignore")
+        print(f"  resumed FineWeb-Edu partial: {len(all_text):,} chars", flush=True)
+        if len(all_text) >= target_chars:
+            split_point = len(all_text) - val_char_budget
+            return all_text[:split_point], all_text[split_point:]
+
+    attempt = 0
+    skip_docs = 0  # rough resume position (doc count)
+    while attempt < max_retries and len(all_text) < target_chars:
+        try:
+            ds = load_dataset(
+                "HuggingFaceFW/fineweb-edu",
+                name=subset,
+                split="train",
+                streaming=True,
+                cache_dir=str(cache_dir),
+            )
+            pieces: list[str] = [all_text] if all_text else []
+            total_chars = len(all_text)
+            doc_count = 0
+            last_checkpoint_chars = total_chars
+            for row in ds:
+                doc_count += 1
+                if doc_count <= skip_docs:
+                    continue
+                t = row.get("text", "")
+                if not t or len(t) < 50:
+                    continue
+                pieces.append(t)
+                total_chars += len(t)
+                if total_chars >= target_chars:
+                    break
+                if total_chars - last_checkpoint_chars >= 50_000_000:
+                    partial_path.write_text("".join(pieces), encoding="utf-8")
+                    last_checkpoint_chars = total_chars
+                    print(f"  checkpointed at {total_chars:,} chars "
+                          f"(doc {doc_count:,})", flush=True)
+                if doc_count % 10000 == 0:
+                    print(f"  streamed doc {doc_count:,}, "
+                          f"{total_chars:,} chars", flush=True)
+            all_text = "".join(pieces)
             break
-        if len(pieces) % 10000 == 0:
-            print(f"  streamed {len(pieces):,} docs, {total_chars:,} chars", flush=True)
+        except Exception as e:
+            attempt += 1
+            wait = min(60, 2 ** attempt)
+            print(f"  fineweb-edu stream error (attempt {attempt}/{max_retries}): "
+                  f"{type(e).__name__}: {e}. Retrying in {wait}s...", flush=True)
+            partial_path.write_text(all_text, encoding="utf-8")
+            skip_docs = doc_count if 'doc_count' in locals() else 0
+            time.sleep(wait)
+    else:
+        if len(all_text) < target_chars * 0.5:
+            raise RuntimeError(
+                f"FineWeb-Edu streaming failed after {max_retries} attempts; "
+                f"only got {len(all_text):,} chars of target {target_chars:,}. "
+                f"Check network or use a different dataset."
+            )
+        print(f"  proceeding with partial {len(all_text):,} / {target_chars:,} chars",
+              flush=True)
 
-    all_text = "".join(pieces)
-    # Split: last val_char_budget chars for validation, rest for training
-    split_point = len(all_text) - val_char_budget
+    if partial_path.exists():
+        partial_path.unlink()  # cleanup after success
+
+    split_point = max(1, len(all_text) - val_char_budget)
     train_text = all_text[:split_point]
     val_text = all_text[split_point:]
-    print(f"FineWeb-Edu: train {len(train_text):,} chars, val {len(val_text):,} chars "
-          f"({len(pieces):,} docs)", flush=True)
+    print(f"FineWeb-Edu: train {len(train_text):,} chars, val {len(val_text):,} chars",
+          flush=True)
     return train_text, val_text
 
 
