@@ -28,6 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .nn_utils import RMSNorm, SwiGLU, precompute_rope, apply_rope
+from .baseline import CausalAttention
 
 
 @torch.jit.script
@@ -225,6 +226,23 @@ class LSABlock(nn.Module):
         return x
 
 
+class _FullAttentionBlock(nn.Module):
+    """Vanilla transformer block used in interleaved slots of LSA v1."""
+
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.0):
+        super().__init__()
+        self.norm1 = RMSNorm(d_model)
+        self.attn = CausalAttention(d_model, n_heads, dropout)
+        self.norm2 = RMSNorm(d_model)
+        self.mlp = SwiGLU(d_model, d_ff, dropout)
+
+    def forward(self, x: torch.Tensor,
+                rope_cos: torch.Tensor, rope_sin: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x), rope_cos, rope_sin)
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
 class LSALanguageModel(nn.Module):
     """Decoder-only language model using LSA blocks."""
 
@@ -233,7 +251,8 @@ class LSALanguageModel(nn.Module):
                  d_kv_latent: int, d_state: int,
                  max_seq_len: int, dropout: float = 0.0,
                  rope_base: float = 10000.0, tie_weights: bool = True,
-                 window_size: int | None = None):
+                 window_size: int | None = None,
+                 interleave_ratio: int | None = None):
         super().__init__()
         assert d_model == n_heads * d_head, \
             f"d_model ({d_model}) must equal n_heads ({n_heads}) * d_head ({d_head})"
@@ -243,13 +262,25 @@ class LSALanguageModel(nn.Module):
         self.n_layers = n_layers
         self.max_seq_len = max_seq_len
         self.window_size = window_size
+        self.interleave_ratio = interleave_ratio
 
         self.token_emb = nn.Embedding(vocab_size, d_model)
-        self.blocks = nn.ModuleList([
-            LSABlock(d_model, n_heads, d_ff, d_kv_latent, d_state, dropout,
-                     window_size=window_size)
-            for _ in range(n_layers)
-        ])
+
+        blocks: list[nn.Module] = []
+        for i in range(n_layers):
+            is_full = (
+                interleave_ratio is not None
+                and interleave_ratio > 0
+                and (i + 1) % (interleave_ratio + 1) == 0
+            )
+            if is_full:
+                blocks.append(_FullAttentionBlock(d_model, n_heads, d_ff, dropout))
+            else:
+                blocks.append(
+                    LSABlock(d_model, n_heads, d_ff, d_kv_latent, d_state, dropout,
+                             window_size=window_size)
+                )
+        self.blocks = nn.ModuleList(blocks)
         self.norm_f = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 

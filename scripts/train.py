@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT))
 
 from aria.data import build_datasets, build_bpe_datasets, RandomWindowSampler
 from aria.lsa import LSALanguageModel
+from aria.lsa_v2 import LSAv2LanguageModel
 from aria.baseline import BaselineLanguageModel
 from aria.nn_utils import count_parameters
 from aria.trainer import Trainer, TrainConfig, resolve_device
@@ -30,6 +31,7 @@ from aria.trainer import Trainer, TrainConfig, resolve_device
 
 MODEL_REGISTRY = {
     "lsa": LSALanguageModel,
+    "lsa_v2": LSAv2LanguageModel,
     "baseline": BaselineLanguageModel,
 }
 
