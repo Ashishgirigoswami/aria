@@ -178,20 +178,25 @@ class XLATrainer:
             g["lr"] = lr
 
         self.optimizer.zero_grad(set_to_none=True)
+        # Accumulate losses as tensors to avoid .item() syncs inside the loop.
+        # Calling .item() between backward passes forces XLA to materialize the
+        # intermediate graph, which can break custom autograd Functions (like
+        # the SSM scan) that rely on lazy evaluation of the full graph.
+        loss_accum = torch.tensor(0.0, device=self.device)
         for _ in range(self.cfg.grad_accum_steps):
             x, y = self.train_sampler.sample()
             x, y = x.to(self.device), y.to(self.device)
             _, loss = self.model(x, y)
             loss = loss / self.cfg.grad_accum_steps
             loss.backward()
-            total_loss += loss.item() * self.cfg.grad_accum_steps
+            loss_accum = loss_accum + loss.detach()
 
         if self.cfg.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
 
-        xm.optimizer_step(self.optimizer)  # single-core: barrier=True implicit
+        xm.optimizer_step(self.optimizer)
         torch_xla.sync()
-        return total_loss / self.cfg.grad_accum_steps
+        return loss_accum.item()
 
     def fit(self) -> dict[str, Any]:
         print(f"Training {self.cfg.run_name} on {self.device}")
