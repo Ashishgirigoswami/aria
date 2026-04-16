@@ -61,6 +61,7 @@ class XLATrainConfig:
     run_name: str = "xla_run"
     lr_schedule: str = "cosine"       # "cosine" or "wsd"
     wsd_decay_start: float = 0.8      # fraction of max_steps where decay begins
+    ckpt_every: int = 200             # save checkpoint every N steps (for spot preemption)
 
 
 def _require_xla() -> None:
@@ -233,6 +234,10 @@ class XLATrainer:
 
             if self.step % self.cfg.log_every == 0:
                 pbar.set_postfix(loss=f"{loss:.4f}")
+
+            # Periodic checkpoint for spot preemption recovery
+            if self.cfg.ckpt_every > 0 and self.step % self.cfg.ckpt_every == 0:
+                self.save_checkpoint("latest")
 
             if self.step % self.cfg.eval_every == 0 or self.step == self.cfg.max_steps:
                 metrics = self.evaluate()

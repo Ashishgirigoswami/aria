@@ -112,10 +112,15 @@ def main() -> None:
 
     resume_path = args.resume
     if resume_path is None:
-        auto = Path(train_cfg.checkpoint_dir) / "final.pt"
-        if auto.exists():
-            resume_path = str(auto)
-            print(f"Auto-detected resume checkpoint: {resume_path}")
+        # Prefer latest.pt (periodic checkpoint) for preemption recovery,
+        # then best.pt, then final.pt.
+        ckpt_dir = Path(train_cfg.checkpoint_dir)
+        for name in ("latest.pt", "best.pt", "final.pt"):
+            candidate = ckpt_dir / name
+            if candidate.exists():
+                resume_path = str(candidate)
+                print(f"Auto-detected resume checkpoint: {resume_path}")
+                break
     if resume_path:
         trainer.load_checkpoint(resume_path)
 
