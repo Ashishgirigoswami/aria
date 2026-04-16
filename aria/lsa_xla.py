@@ -157,101 +157,140 @@ class _GDNScanFunction(torch.autograd.Function):
                 q_i, k_i, v_i, g_i, b_i = x
                 alpha = torch.exp(g_i)
                 S_pre = S * alpha[:, :, None, None]
-                # S^T k: contract over K → (B,H,V)
                 sTk = (S_pre * k_i.unsqueeze(-1)).sum(-2)
                 v_new = b_i[:, :, None] * (v_i - sTk)
-                # k ⊗ v_new: outer product → (B,H,K,V)
                 S_new = S_pre + k_i.unsqueeze(-1) * v_new.unsqueeze(-2)
-                # S^T q: contract over K → (B,H,V)
                 o_i = (S_new * q_i.unsqueeze(-1)).sum(-2)
-                return S_new, o_i
+                # Return both state and output — xla_scan saves output stack
+                return S_new, (S_new, o_i)
 
-            _, outputs = xla_scan(fwd_step, init_S, xs)
+            _, (states, outputs) = xla_scan(fwd_step, init_S, xs)
+            # states: (T, B, H, K, V) — all intermediate states from one compiled iteration
+            # outputs: (T, B, H, V)
             out = outputs.permute(1, 2, 0, 3).to(q.dtype)
+            states_saved = states  # (T, B, H, K, V) — save for backward
         else:
             S = torch.zeros(B, H, K, V, dtype=torch.float32, device=q.device)
             out = torch.empty(B, H, T, V, dtype=q.dtype, device=q.device)
+            states_list = []
             for t in range(T):
                 alpha = torch.exp(g_f[:, :, t])
                 S = S * alpha[:, :, None, None]
                 sTk = (S * k_f[:, :, t].unsqueeze(-1)).sum(-2)
                 v_new = b_f[:, :, t, None] * (v_f[:, :, t] - sTk)
                 S = S + k_f[:, :, t].unsqueeze(-1) * v_new.unsqueeze(-2)
+                states_list.append(S.clone())
                 out[:, :, t] = (S * q_f[:, :, t].unsqueeze(-1)).sum(-2).to(q.dtype)
+            states_saved = torch.stack(states_list, dim=0)  # (T, B, H, K, V)
 
-        ctx.save_for_backward(q, k, v, g, beta, out)
+        ctx.save_for_backward(q, k, v, g, beta, states_saved)
         return out
 
     @staticmethod
     def backward(ctx, grad_output):
-        q, k, v, g, beta, out = ctx.saved_tensors
+        q, k, v, g, beta, states = ctx.saved_tensors
         B, H, T, K = q.shape
         V = v.size(-1)
 
-        # Recompute forward states (needed for backward)
         q_f, k_f, v_f = q.float(), k.float(), v.float()
         g_f, b_f = g.float(), beta.float()
         go = grad_output.float()
 
-        # Simple Python backward (no XLA scan for backward — too complex for matrix state).
-        # This is slower but correct. The forward uses XLA scan for speed;
-        # backward is less critical since it runs once per step.
-        # Recompute forward states — NO einsum, use explicit matmul/broadcast
-        states = []
-        S = torch.zeros(B, H, K, V, dtype=torch.float32, device=q.device)
-        for t in range(T):
-            alpha = torch.exp(g_f[:, :, t])
-            k_t = k_f[:, :, t]
-            v_t = v_f[:, :, t]
-            S = S * alpha[:, :, None, None]
-            sTk = (S * k_t.unsqueeze(-1)).sum(-2)
-            v_new = b_f[:, :, t, None] * (v_t - sTk)
-            S = S + k_t.unsqueeze(-1) * v_new.unsqueeze(-2)
-            states.append(S)
+        # Build S_prev (zero at t=0, states[t-1] for t>0).
+        # states shape: (T, B, H, K, V)  — already on correct device, no recompute needed
+        zero_S = torch.zeros(1, B, H, K, V, dtype=torch.float32, device=q.device)
+        S_prev_all = torch.cat([zero_S, states[:-1]], dim=0)  # (T, B, H, K, V)
 
-        # Backward pass — NO einsum, use explicit broadcast ops
-        dq = torch.zeros_like(q_f)
-        dk = torch.zeros_like(k_f)
-        dv = torch.zeros_like(v_f)
-        dg = torch.zeros_like(g_f)
-        dbeta = torch.zeros_like(b_f)
-        dS = torch.zeros(B, H, K, V, dtype=torch.float32, device=q.device)
+        # Permute everything to time-first for scan
+        q_t = q_f.permute(2, 0, 1, 3)    # (T, B, H, K)
+        k_t = k_f.permute(2, 0, 1, 3)    # (T, B, H, K)
+        v_t = v_f.permute(2, 0, 1, 3)    # (T, B, H, V)
+        g_t = g_f.permute(2, 0, 1)       # (T, B, H)
+        b_t = b_f.permute(2, 0, 1)       # (T, B, H)
+        go_t = go.permute(2, 0, 1, 3)    # (T, B, H, V)
+        # states: already (T, B, H, K, V)
+        # S_prev_all: already (T, B, H, K, V)
 
-        for t in range(T - 1, -1, -1):
-            S_t = states[t]
-            S_prev = states[t - 1] if t > 0 else torch.zeros_like(S_t)
-            alpha_t = torch.exp(g_f[:, :, t])
-            k_t = k_f[:, :, t]
-            v_t = v_f[:, :, t]
-            q_t = q_f[:, :, t]
-            beta_t = b_f[:, :, t]
-            go_t = go[:, :, t]
+        if HAS_XLA_SCAN:
+            # REVERSE scan: iterate from T-1 to 0. Flip time dim.
+            xs_rev = (
+                q_t.flip(0), k_t.flip(0), v_t.flip(0),
+                g_t.flip(0), b_t.flip(0), go_t.flip(0),
+                states.flip(0), S_prev_all.flip(0),
+            )
+            init_dS = torch.zeros(B, H, K, V, dtype=torch.float32, device=q.device)
 
-            # dq: S^T @ go → contract over V → (B,H,K)
-            dq[:, :, t] = (S_t * go_t.unsqueeze(-2)).sum(-1)
-            # dS += q ⊗ go → outer product (B,H,K,V)
-            dS = dS + q_t.unsqueeze(-1) * go_t.unsqueeze(-2)
+            def bwd_step(dS, x):
+                q_i, k_i, v_i, g_i, b_i, go_i, S_t, S_prev = x
+                alpha = torch.exp(g_i)
 
-            S_pre = S_prev * alpha_t[:, :, None, None]
-            sTk = (S_pre * k_t.unsqueeze(-1)).sum(-2)
-            v_new = beta_t[:, :, None] * (v_t - sTk)
+                # dq = S_t^T go
+                dq_i = (S_t * go_i.unsqueeze(-2)).sum(-1)
+                # Add q ⊗ go to dS
+                dS_new = dS + q_i.unsqueeze(-1) * go_i.unsqueeze(-2)
 
-            # dv_new from dS @ k → contract over K → (B,H,V)
-            dv_new = (dS * k_t.unsqueeze(-1)).sum(-2)
-            # dk from dS @ v_new → contract over V → (B,H,K)
-            dk[:, :, t] = dk[:, :, t] + (dS * v_new.unsqueeze(-2)).sum(-1)
+                S_pre = S_prev * alpha[:, :, None, None]
+                sTk = (S_pre * k_i.unsqueeze(-1)).sum(-2)
+                v_new = b_i[:, :, None] * (v_i - sTk)
 
-            dbeta[:, :, t] = (dv_new * (v_t - sTk)).sum(dim=-1)
-            dv[:, :, t] = dv[:, :, t] + dv_new * beta_t[:, :, None]
-            dsTk = -dv_new * beta_t[:, :, None]
+                # dv_new from dS @ k_i
+                dv_new = (dS_new * k_i.unsqueeze(-1)).sum(-2)
+                # dk from dS @ v_new
+                dk_i = (dS_new * v_new.unsqueeze(-2)).sum(-1)
 
-            # dS_pre from sTk chain
-            dS_pre_from_sTk = k_t.unsqueeze(-1) * dsTk.unsqueeze(-2)
-            dk[:, :, t] = dk[:, :, t] + (S_pre * dsTk.unsqueeze(-2)).sum(-1)
+                dbeta_i = (dv_new * (v_i - sTk)).sum(dim=-1)
+                dv_i = dv_new * b_i[:, :, None]
+                dsTk = -dv_new * b_i[:, :, None]
 
-            dS_pre = dS + dS_pre_from_sTk
-            dg[:, :, t] = (dS_pre * S_prev * alpha_t[:, :, None, None]).sum(dim=(-2, -1))
-            dS = dS_pre * alpha_t[:, :, None, None]
+                dS_pre_from_sTk = k_i.unsqueeze(-1) * dsTk.unsqueeze(-2)
+                dk_i = dk_i + (S_pre * dsTk.unsqueeze(-2)).sum(-1)
+
+                dS_pre = dS_new + dS_pre_from_sTk
+                dg_i = (dS_pre * S_prev * alpha[:, :, None, None]).sum(dim=(-2, -1))
+                dS_out = dS_pre * alpha[:, :, None, None]
+
+                return dS_out, (dq_i, dk_i, dv_i, dg_i, dbeta_i)
+
+            _, (dq_rev, dk_rev, dv_rev, dg_rev, dbeta_rev) = xla_scan(bwd_step, init_dS, xs_rev)
+            # Flip back to forward time order
+            dq = dq_rev.flip(0).permute(1, 2, 0, 3)
+            dk = dk_rev.flip(0).permute(1, 2, 0, 3)
+            dv = dv_rev.flip(0).permute(1, 2, 0, 3)
+            dg = dg_rev.flip(0).permute(1, 2, 0)
+            dbeta = dbeta_rev.flip(0).permute(1, 2, 0)
+        else:
+            # Fallback: Python loop
+            dq = torch.zeros_like(q_f)
+            dk = torch.zeros_like(k_f)
+            dv = torch.zeros_like(v_f)
+            dg = torch.zeros_like(g_f)
+            dbeta = torch.zeros_like(b_f)
+            dS = torch.zeros(B, H, K, V, dtype=torch.float32, device=q.device)
+            for t in range(T - 1, -1, -1):
+                S_t = states[t]
+                S_prev = S_prev_all[t]
+                alpha = torch.exp(g_f[:, :, t])
+                k_ti = k_f[:, :, t]
+                v_ti = v_f[:, :, t]
+                q_ti = q_f[:, :, t]
+                beta_ti = b_f[:, :, t]
+                go_ti = go[:, :, t]
+
+                dq[:, :, t] = (S_t * go_ti.unsqueeze(-2)).sum(-1)
+                dS = dS + q_ti.unsqueeze(-1) * go_ti.unsqueeze(-2)
+                S_pre = S_prev * alpha[:, :, None, None]
+                sTk = (S_pre * k_ti.unsqueeze(-1)).sum(-2)
+                v_new = beta_ti[:, :, None] * (v_ti - sTk)
+                dv_new = (dS * k_ti.unsqueeze(-1)).sum(-2)
+                dk[:, :, t] = dk[:, :, t] + (dS * v_new.unsqueeze(-2)).sum(-1)
+                dbeta[:, :, t] = (dv_new * (v_ti - sTk)).sum(dim=-1)
+                dv[:, :, t] = dv[:, :, t] + dv_new * beta_ti[:, :, None]
+                dsTk = -dv_new * beta_ti[:, :, None]
+                dS_pre_from_sTk = k_ti.unsqueeze(-1) * dsTk.unsqueeze(-2)
+                dk[:, :, t] = dk[:, :, t] + (S_pre * dsTk.unsqueeze(-2)).sum(-1)
+                dS_pre = dS + dS_pre_from_sTk
+                dg[:, :, t] = (dS_pre * S_prev * alpha[:, :, None, None]).sum(dim=(-2, -1))
+                dS = dS_pre * alpha[:, :, None, None]
 
         return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), dg.to(g.dtype), dbeta.to(beta.dtype)
 
