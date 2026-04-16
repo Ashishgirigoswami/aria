@@ -183,6 +183,57 @@ def load_wikitext103(cache_dir: str | Path, max_train_tokens: int | None = None
     return train_text, val_text
 
 
+def load_fineweb_edu(cache_dir: str | Path, max_train_tokens: int | None = None,
+                     val_tokens: int = 500_000) -> tuple[str, str]:
+    """Load FineWeb-Edu via HuggingFace streaming.
+
+    Streams from ``HuggingFaceFW/fineweb-edu`` (1.3T tokens total). Only
+    downloads as much text as needed for ``max_train_tokens`` (at ~4 chars/BPE
+    token). A small val split is carved from the end of the streamed data.
+
+    FineWeb-Edu is the highest-quality filtered web corpus available (April
+    2026). 10% of its tokens match the performance of 350B unfiltered tokens.
+    """
+    from datasets import load_dataset  # lazy import
+
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Use the "sample-10BT" subset for tractable downloads; full corpus is 1.3T
+    ds = load_dataset(
+        "HuggingFaceFW/fineweb-edu",
+        name="sample-10BT",
+        split="train",
+        streaming=True,
+        cache_dir=str(cache_dir),
+    )
+
+    char_budget = (max_train_tokens or 50_000_000) * 4  # ~4 chars per BPE token
+    val_char_budget = val_tokens * 4
+
+    pieces: list[str] = []
+    total_chars = 0
+    for row in ds:
+        t = row.get("text", "")
+        if not t or len(t) < 50:
+            continue
+        pieces.append(t)
+        total_chars += len(t)
+        if total_chars >= char_budget + val_char_budget:
+            break
+        if len(pieces) % 10000 == 0:
+            print(f"  streamed {len(pieces):,} docs, {total_chars:,} chars", flush=True)
+
+    all_text = "".join(pieces)
+    # Split: last val_char_budget chars for validation, rest for training
+    split_point = len(all_text) - val_char_budget
+    train_text = all_text[:split_point]
+    val_text = all_text[split_point:]
+    print(f"FineWeb-Edu: train {len(train_text):,} chars, val {len(val_text):,} chars "
+          f"({len(pieces):,} docs)", flush=True)
+    return train_text, val_text
+
+
 def build_bpe_datasets(dataset: str = "tinyshakespeare",
                        cache_dir: str | Path = "./data",
                        seq_len: int = 512,
@@ -194,6 +245,7 @@ def build_bpe_datasets(dataset: str = "tinyshakespeare",
     Supported datasets:
         - tinyshakespeare: small toy corpus, ~300K BPE tokens
         - wikitext-103: ~100M+ train tokens, standard LM benchmark
+        - fineweb-edu: high-quality educational web text (streams from HF Hub)
 
     Returns datasets compatible with the existing CharDataset interface
     (it stores int32 token IDs — label is misleading but the type is the same).
@@ -219,6 +271,10 @@ def build_bpe_datasets(dataset: str = "tinyshakespeare",
         val_arr.tofile(val_bin)
     elif dataset == "wikitext-103":
         train_text, val_text = load_wikitext103(cache_dir, max_train_tokens)
+        train_arr = _tokenize_to_binfile(train_text, tokenizer, train_bin)
+        val_arr = _tokenize_to_binfile(val_text, tokenizer, val_bin)
+    elif dataset == "fineweb-edu":
+        train_text, val_text = load_fineweb_edu(cache_dir, max_train_tokens)
         train_arr = _tokenize_to_binfile(train_text, tokenizer, train_bin)
         val_arr = _tokenize_to_binfile(val_text, tokenizer, val_bin)
     else:

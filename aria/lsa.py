@@ -75,9 +75,10 @@ class LSAAttention(nn.Module):
 
     def __init__(self, d_model: int, n_heads: int,
                  d_kv_latent: int, d_state: int, dropout: float = 0.0,
-                 window_size: int | None = None):
+                 window_size: int | None = None, qk_norm: bool = False):
         super().__init__()
         self.window_size = window_size
+        self.qk_norm = qk_norm
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
         self.d_model = d_model
         self.n_heads = n_heads
@@ -108,6 +109,13 @@ class LSAAttention(nn.Module):
         self.w_o = nn.Linear(d_model, d_model, bias=False)
 
         self.dropout = nn.Dropout(dropout)
+
+        # QK-Norm: RMSNorm on Q and K per-head before computing scores.
+        # Prevents attention score overflow, especially at long seq_len on TPU.
+        # Used by Qwen3, Gemma2, and most 2025+ frontier models.
+        if qk_norm:
+            self.q_norm = RMSNorm(self.d_head)
+            self.k_norm = RMSNorm(self.d_head)
 
         # Initialize SSM gates so the state is neutral at init:
         # A ~ 1 (preserve state), B ~ 0 (minimal new writes)
@@ -161,6 +169,11 @@ class LSAAttention(nn.Module):
         k_state = self.w_state_k(states).view(B, T, H, Dh)
         v_state = self.w_state_v(states).view(B, T, H, Dh)
 
+        # Optional QK-Norm — stabilizes attention scores at long seq_len.
+        if self.qk_norm:
+            q = self.q_norm(q)
+            k_local = self.k_norm(k_local)
+
         # --- Attention over [local causal KV] + [per-position state KV] ---
         # Reshape to (B, H, T, Dh)
         q = q.transpose(1, 2)
@@ -211,11 +224,11 @@ class LSABlock(nn.Module):
 
     def __init__(self, d_model: int, n_heads: int, d_ff: int,
                  d_kv_latent: int, d_state: int, dropout: float = 0.0,
-                 window_size: int | None = None):
+                 window_size: int | None = None, qk_norm: bool = False):
         super().__init__()
         self.norm1 = RMSNorm(d_model)
         self.attn = LSAAttention(d_model, n_heads, d_kv_latent, d_state, dropout,
-                                 window_size=window_size)
+                                 window_size=window_size, qk_norm=qk_norm)
         self.norm2 = RMSNorm(d_model)
         self.mlp = SwiGLU(d_model, d_ff, dropout)
 
@@ -298,7 +311,8 @@ class LSALanguageModel(nn.Module):
                  max_seq_len: int, dropout: float = 0.0,
                  rope_base: float = 10000.0, tie_weights: bool = True,
                  window_size: int | None = None,
-                 interleave_ratio: int | None = None):
+                 interleave_ratio: int | None = None,
+                 qk_norm: bool = False):
         super().__init__()
         assert d_model == n_heads * d_head, \
             f"d_model ({d_model}) must equal n_heads ({n_heads}) * d_head ({d_head})"
@@ -324,7 +338,7 @@ class LSALanguageModel(nn.Module):
             else:
                 blocks.append(
                     LSABlock(d_model, n_heads, d_ff, d_kv_latent, d_state, dropout,
-                             window_size=window_size)
+                             window_size=window_size, qk_norm=qk_norm)
                 )
         self.blocks = nn.ModuleList(blocks)
         self.norm_f = RMSNorm(d_model)
