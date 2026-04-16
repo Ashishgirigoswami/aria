@@ -21,7 +21,7 @@ from aria.data import build_bpe_datasets
 def main() -> None:
     parser = argparse.ArgumentParser(description="Prepare BPE-tokenized dataset cache.")
     parser.add_argument("--dataset", default="wikitext-103",
-                        choices=["wikitext-103", "tinyshakespeare"])
+                        choices=["wikitext-103", "tinyshakespeare", "fineweb-edu"])
     parser.add_argument("--cache-dir", default="./data")
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--max-tokens", type=int, default=50_000_000)
