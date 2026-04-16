@@ -10,7 +10,7 @@ model:
   d_ff: 2200
   d_kv_latent: 384
   d_state: 192
-  max_seq_len: 1024
+  max_seq_len: 512
   dropout: 0.0
   rope_base: 10000.0
   tie_weights: true
@@ -20,13 +20,13 @@ data:
   dataset: wikitext-103
   tokenizer: bpe
   cache_dir: ./data
-  seq_len: 1024
+  seq_len: 512
   train_split: 0.98
-  max_train_tokens: 50000000    # wikitext has 100M total, use 50M (~3x Chinchilla for 150M)
+  max_train_tokens: 50000000
 
 training:
-  batch_size: 4                 # reduced from 16 to fit v6e-4 memory
-  grad_accum_steps: 16          # effective batch 64 unchanged
+  batch_size: 2                 # v6e-4 has only 30GB available after other overhead
+  grad_accum_steps: 32          # effective batch 64 unchanged
   max_steps: 8000
   eval_every: 400
   eval_iters: 50
