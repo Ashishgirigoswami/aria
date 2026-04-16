@@ -27,8 +27,8 @@ data:
   max_train_tokens: 50000000
 
 training:
-  batch_size: 16
-  grad_accum_steps: 2
+  batch_size: 4
+  grad_accum_steps: 8             # effective batch still 32; GDN matrix state needs more memory
   max_steps: 8000
   eval_every: 400
   eval_iters: 50
