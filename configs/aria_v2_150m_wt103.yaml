@@ -1,0 +1,50 @@
+# ARIA 150M on wikitext-103 — fallback if fineweb-edu streaming fails
+# Same architecture as aria_v2_150m_fwe.yaml but on smaller corpus
+model:
+  name: lsa_v2
+  vocab_size: 50257
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  d_head: 64
+  d_ff: 2200
+  d_kv_latent: 384
+  d_state: 192
+  max_seq_len: 2048
+  dropout: 0.0
+  rope_base: 10000.0
+  tie_weights: true
+  interleave_ratio: 3
+
+data:
+  dataset: wikitext-103
+  tokenizer: bpe
+  cache_dir: ./data
+  seq_len: 2048
+  train_split: 0.98
+  max_train_tokens: 50000000    # wikitext has 100M total, use 50M (~3x Chinchilla for 150M)
+
+training:
+  batch_size: 16
+  grad_accum_steps: 4
+  max_steps: 8000
+  eval_every: 400
+  eval_iters: 50
+  warmup_steps: 500
+  lr: 6.0e-4
+  min_lr: 6.0e-5
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+  amp: true
+  device: auto
+  seed: 42
+  lr_schedule: wsd
+  wsd_decay_start: 0.8
+  ckpt_every: 200
+
+logging:
+  run_name: aria_v2_150m_wt103
+  checkpoint_dir: ./checkpoints/aria_v2_150m_wt103
+  log_every: 50
