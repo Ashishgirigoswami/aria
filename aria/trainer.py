@@ -49,6 +49,8 @@ class TrainConfig:
     log_every: int = 20
     checkpoint_dir: str = "./checkpoints/run"
     run_name: str = "run"
+    lr_schedule: str = "cosine"       # "cosine" or "wsd"
+    wsd_decay_start: float = 0.8      # fraction of max_steps where decay begins
 
 
 def resolve_device(device: str) -> torch.device:
@@ -84,6 +86,34 @@ def cosine_lr(step: int, warmup: int, max_steps: int,
     if step >= max_steps:
         return min_lr
     progress = (step - warmup) / max(1, max_steps - warmup)
+    return min_lr + 0.5 * (base_lr - min_lr) * (1.0 + math.cos(math.pi * progress))
+
+
+def wsd_lr(step: int, warmup: int, max_steps: int,
+           base_lr: float, min_lr: float, decay_start: float = 0.8) -> float:
+    """Warmup-Stable-Decay schedule (WSD).
+
+    Used by frontier labs (DeepSeek, Qwen, Nemotron) as a replacement for
+    cosine. Key advantage: no need to pre-commit total compute budget during
+    the stable phase. The decay phase produces sharp loss drops that match
+    or beat cosine final loss.
+
+    Three phases:
+      1. Warmup: linear ramp from 0 to base_lr over warmup steps
+      2. Stable: constant base_lr (the bulk of training)
+      3. Decay: cosine decay from base_lr to min_lr
+
+    ``decay_start`` is the fraction of max_steps where the decay phase begins
+    (default 0.8 = last 20% of training is decay).
+    """
+    if step < warmup:
+        return base_lr * (step + 1) / max(1, warmup)
+    decay_step = int(max_steps * decay_start)
+    if step < decay_step:
+        return base_lr
+    if step >= max_steps:
+        return min_lr
+    progress = (step - decay_step) / max(1, max_steps - decay_step)
     return min_lr + 0.5 * (base_lr - min_lr) * (1.0 + math.cos(math.pi * progress))
 
 
@@ -161,8 +191,12 @@ class Trainer:
         self.model.train()
         total_loss = 0.0
 
-        lr = cosine_lr(self.step, self.cfg.warmup_steps, self.cfg.max_steps,
-                       self.cfg.lr, self.cfg.min_lr)
+        if self.cfg.lr_schedule == "wsd":
+            lr = wsd_lr(self.step, self.cfg.warmup_steps, self.cfg.max_steps,
+                        self.cfg.lr, self.cfg.min_lr, self.cfg.wsd_decay_start)
+        else:
+            lr = cosine_lr(self.step, self.cfg.warmup_steps, self.cfg.max_steps,
+                           self.cfg.lr, self.cfg.min_lr)
         for g in self.optimizer.param_groups:
             g["lr"] = lr
 
