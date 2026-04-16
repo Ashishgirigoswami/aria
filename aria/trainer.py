@@ -51,6 +51,8 @@ class TrainConfig:
     run_name: str = "run"
     lr_schedule: str = "cosine"       # "cosine" or "wsd"
     wsd_decay_start: float = 0.8      # fraction of max_steps where decay begins
+    seesaw: bool = False              # Seesaw batch scheduling: double batch at LR halving points
+    seesaw_max_batch: int = 0         # max batch size for seesaw (0 = no limit)
 
 
 def resolve_device(device: str) -> torch.device:
@@ -218,6 +220,29 @@ class Trainer:
         self.scaler.update()
         return total_loss / self.cfg.grad_accum_steps
 
+    def _apply_seesaw(self) -> None:
+        """Seesaw batch scheduling (arXiv 2510.14717).
+
+        At 25%, 50%, 75% of training, double the effective batch size by
+        doubling grad_accum_steps. The LR schedule naturally provides the
+        corresponding reduction. Gives ~36% wall-clock savings at scale.
+        """
+        if not self.cfg.seesaw:
+            return
+        milestones = [0.25, 0.50, 0.75]
+        for frac in milestones:
+            milestone_step = int(self.cfg.max_steps * frac)
+            if self.step == milestone_step:
+                max_batch = self.cfg.seesaw_max_batch or float('inf')
+                new_accum = self.cfg.grad_accum_steps * 2
+                new_effective = self.cfg.batch_size * new_accum
+                if new_effective <= max_batch:
+                    self.cfg.grad_accum_steps = new_accum
+                    tqdm.write(
+                        f"  [seesaw] step {self.step}: grad_accum -> {new_accum} "
+                        f"(effective batch {new_effective})"
+                    )
+
     def fit(self) -> dict[str, Any]:
         print(f"Training {self.cfg.run_name} on {self.device}")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
@@ -226,6 +251,7 @@ class Trainer:
 
         pbar = tqdm(range(self.cfg.max_steps), desc=self.cfg.run_name)
         for _ in pbar:
+            self._apply_seesaw()
             loss = self.train_step()
             self.step += 1
 
