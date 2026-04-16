@@ -25,18 +25,21 @@ sys.path.insert(0, str(ROOT))
 
 # The XLA LSA module patches ssm_scan_jit BEFORE any model is constructed,
 # so both imports are required and order matters.
-from aria import lsa_xla  # noqa: F401  (side-effect: patches jit scan)
+from aria import lsa_xla  # noqa: F401  (side-effect: patches jit scan for LSA v1)
 from aria.lsa import LSALanguageModel
+from aria.lsa_v2 import LSAv2LanguageModel
 from aria.baseline import BaselineLanguageModel
 from aria.data import build_datasets, build_bpe_datasets, RandomWindowSampler
 from aria.nn_utils import count_parameters
 from aria.trainer_xla import XLATrainer, XLATrainConfig
 
+import torch_xla
 import torch_xla.core.xla_model as xm
 
 
 MODEL_REGISTRY = {
     "lsa": LSALanguageModel,
+    "lsa_v2": LSAv2LanguageModel,
     "baseline": BaselineLanguageModel,
 }
 
