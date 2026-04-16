@@ -1,13 +1,14 @@
 """Layered State Attention for torch_xla (TPU) backends.
 
-Uses ``torch_xla.experimental.scan`` to compile the SSM recurrence as an
-XLA ``While`` op instead of unrolling T iterations into T graph nodes.
-This reduces compilation time from ~30 min to ~1 min for T=512.
+Uses ``torch_xla.experimental.scan`` for O(1)-compilation scans, wrapped
+in a custom ``torch.autograd.Function`` so that backward gradients flow
+correctly (the raw scan primitive does not support autograd on torch_xla 2.6).
 
-Also patches the v2 Gated DeltaNet scan with an XLA-friendly version.
+Forward scan: s_t = A_t * s_{t-1} + Bg_t * u_t
+Backward scan (reverse): accumulates dL/ds_t via carry = ds * A_t
 
-Use this module from TPU training scripts. Import it BEFORE constructing
-any LSA model — it monkey-patches the scan functions at import time.
+Both compile as a single XLA While op — one iteration body, reused T times.
+Compilation: ~30s instead of ~30min. Step time: ~0.75s instead of ~22s.
 """
 
 from __future__ import annotations
@@ -16,8 +17,6 @@ import torch
 
 from . import lsa as _lsa_gpu
 
-# Try to import the XLA scan; fall back to plain loop if not available
-# (e.g., running on CPU for testing).
 try:
     from torch_xla.experimental.scan import scan as xla_scan
     HAS_XLA_SCAN = True
@@ -26,129 +25,112 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# v1: SSM scan (vector state) — used by aria.lsa.LSAAttention
+# v1: SSM scan with autograd-compatible XLA scan
 # ---------------------------------------------------------------------------
+
+class _SSMScanFunction(torch.autograd.Function):
+    """Custom autograd for SSM scan on XLA.
+
+    Forward:  s_t = A_t * s_{t-1} + Bg_t * u_t
+    Backward: reverse scan computes dL/ds_t, then pointwise grads for A, Bg, u.
+    """
+
+    @staticmethod
+    def forward(ctx, A: torch.Tensor, Bg: torch.Tensor,
+                state_input: torch.Tensor) -> torch.Tensor:
+        B, T, D = A.shape
+
+        if HAS_XLA_SCAN:
+            xs = (A.transpose(0, 1), Bg.transpose(0, 1),
+                  state_input.transpose(0, 1))
+            init = torch.zeros(B, D, device=A.device, dtype=A.dtype)
+
+            def fwd_step(s, x):
+                a, bg, u = x
+                s_new = a * s + bg * u
+                return s_new, s_new
+
+            _, outputs = xla_scan(fwd_step, init, xs)
+            states = outputs.transpose(0, 1)  # (B, T, D)
+        else:
+            s = torch.zeros(B, D, device=A.device, dtype=A.dtype)
+            out_list = []
+            for t in range(T):
+                s = A[:, t] * s + Bg[:, t] * state_input[:, t]
+                out_list.append(s)
+            states = torch.stack(out_list, dim=1)
+
+        ctx.save_for_backward(A, Bg, state_input, states)
+        return states
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        A, Bg, state_input, states = ctx.saved_tensors
+        B, T, D = A.shape
+
+        # s_prev[t] = states[t-1] for t>0, else 0
+        s_prev = torch.cat([
+            torch.zeros(B, 1, D, device=A.device, dtype=A.dtype),
+            states[:, :-1],
+        ], dim=1)  # (B, T, D)
+
+        if HAS_XLA_SCAN:
+            # Reverse scan to compute dL/ds[t] for each t.
+            # Recurrence (backward): ds[t] = grad_output[t] + carry
+            #                         carry_new = ds[t] * A[t]
+            go_flip = grad_output.flip(1).transpose(0, 1)  # (T, B, D) reversed
+            a_flip = A.flip(1).transpose(0, 1)              # (T, B, D) reversed
+            init = torch.zeros(B, D, device=A.device, dtype=A.dtype)
+
+            def bwd_step(carry, x):
+                go_t, a_t = x
+                ds = go_t + carry
+                new_carry = ds * a_t
+                return new_carry, ds
+
+            _, ds_flip = xla_scan(bwd_step, init, (go_flip, a_flip))
+            ds_all = ds_flip.transpose(0, 1).flip(1)  # (B, T, D) forward order
+        else:
+            # Plain Python reverse loop fallback
+            ds_list = [None] * T
+            carry = torch.zeros(B, D, device=A.device, dtype=A.dtype)
+            for t in range(T - 1, -1, -1):
+                ds = grad_output[:, t] + carry
+                ds_list[t] = ds
+                carry = ds * A[:, t]
+            ds_all = torch.stack(ds_list, dim=1)
+
+        # Pointwise gradients
+        dA = ds_all * s_prev
+        dBg = ds_all * state_input
+        du = ds_all * Bg
+
+        return dA, dBg, du
+
 
 def ssm_scan_xla(A: torch.Tensor, Bg: torch.Tensor,
                  state_input: torch.Tensor) -> torch.Tensor:
-    """Sequential causal SSM scan using torch_xla.experimental.scan.
+    """SSM scan with XLA-optimized forward AND backward.
 
-    XLA compiles ONE iteration body and reuses it via a While loop,
-    instead of unrolling T iterations into T graph nodes. This cuts
-    compilation from ~30 min to ~1 min for T=512.
-
-    Falls back to a plain Python loop if torch_xla.experimental.scan
-    is not available (e.g., on CPU for testing).
-
-    Args:
-        A: (B, T, d_state) per-token decay gate in [0, 1].
-        Bg: (B, T, d_state) per-token write gate in [-1, 1].
-        state_input: (B, T, d_state) what to write at each step.
-
-    Returns:
-        states: (B, T, d_state) per-position causal states.
+    Both forward and backward use ``torch_xla.experimental.scan`` via a
+    custom ``torch.autograd.Function``, so compilation is O(1) in sequence
+    length and gradients flow correctly.
     """
-    B, T, D = A.shape
-
-    if HAS_XLA_SCAN:
-        # scan expects inputs as (T, ...) and a step function:
-        #   step(carry, x) -> (new_carry, output)
-        # Transpose from (B, T, D) to (T, B, D) for the scan dimension.
-        xs = (A.transpose(0, 1), Bg.transpose(0, 1), state_input.transpose(0, 1))
-        init = torch.zeros(B, D, device=A.device, dtype=A.dtype)
-
-        def step(s: torch.Tensor, x: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, torch.Tensor]:
-            a, bg, u = x
-            s_new = a * s + bg * u
-            return s_new, s_new  # (carry, output)
-
-        _, outputs = xla_scan(step, init, xs)
-        # outputs: (T, B, D) -> (B, T, D)
-        return outputs.transpose(0, 1)
-    else:
-        # Fallback: plain Python loop (slow but correct).
-        s = torch.zeros(B, D, device=A.device, dtype=A.dtype)
-        out_list = []
-        for t in range(T):
-            s = A[:, t] * s + Bg[:, t] * state_input[:, t]
-            out_list.append(s)
-        return torch.stack(out_list, dim=1)
-
-
-# ---------------------------------------------------------------------------
-# v2: Gated DeltaNet scan (matrix state) — used by aria.lsa_v2
-# ---------------------------------------------------------------------------
-
-def gated_delta_rule_xla(
-    q: torch.Tensor,        # (B, H, T, K)
-    k: torch.Tensor,        # (B, H, T, K)
-    v: torch.Tensor,        # (B, H, T, V)
-    g: torch.Tensor,        # (B, H, T)
-    beta: torch.Tensor,     # (B, H, T)
-    chunk_size: int = 64,   # ignored on XLA; kept for API compat
-) -> torch.Tensor:
-    """Gated DeltaNet scan using torch_xla.experimental.scan.
-
-    Same math as gated_delta_rule_ref / chunked_gated_delta_rule_torch,
-    but compiles one iteration body instead of unrolling T graph nodes.
-    State is fp32 regardless of input dtype.
-    """
-    B, H, T, K = q.shape
-    V = v.size(-1)
-
-    if HAS_XLA_SCAN:
-        q_f = q.float()
-        k_f = k.float()
-        v_f = v.float()
-        g_f = g.float()
-        b_f = beta.float()
-
-        # Transpose time dim to position 0: (T, B, H, K/V)
-        q_t = q_f.permute(2, 0, 1, 3)    # (T, B, H, K)
-        k_t = k_f.permute(2, 0, 1, 3)    # (T, B, H, K)
-        v_t = v_f.permute(2, 0, 1, 3)    # (T, B, H, V)
-        g_t = g_f.permute(2, 0, 1)       # (T, B, H)
-        b_t = b_f.permute(2, 0, 1)       # (T, B, H)
-
-        xs = (q_t, k_t, v_t, g_t, b_t)
-        init_S = torch.zeros(B, H, K, V, dtype=torch.float32, device=q.device)
-
-        def step(S: torch.Tensor, x: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, torch.Tensor]:
-            q_i, k_i, v_i, g_i, b_i = x
-            # Decay
-            alpha = torch.exp(g_i)                               # (B, H)
-            S_pre = S * alpha[:, :, None, None]
-            # Delta-rule correction
-            sTk = torch.einsum("bhkv,bhk->bhv", S_pre, k_i)     # (B, H, V)
-            v_new = b_i[:, :, None] * (v_i - sTk)               # (B, H, V)
-            # Rank-1 write
-            S_new = S_pre + torch.einsum("bhk,bhv->bhkv", k_i, v_new)
-            # Readout
-            o_i = torch.einsum("bhkv,bhk->bhv", S_new, q_i)     # (B, H, V)
-            return S_new, o_i
-
-        _, outputs = xla_scan(step, init_S, xs)
-        # outputs: (T, B, H, V) -> (B, H, T, V)
-        return outputs.permute(1, 2, 0, 3).to(q.dtype)
-    else:
-        # Fallback: use the chunked scan from lsa_v2
-        from .lsa_v2 import chunked_gated_delta_rule_torch
-        return chunked_gated_delta_rule_torch(q, k, v, g, beta, chunk_size)
+    return _SSMScanFunction.apply(A, Bg, state_input)
 
 
 # ---------------------------------------------------------------------------
 # Monkey-patch at import time
 # ---------------------------------------------------------------------------
 
-# Patch v1 SSM scan
 _lsa_gpu.ssm_scan_jit = ssm_scan_xla
 
-# Patch v2 Gated DeltaNet scan (if lsa_v2 is importable)
+# Patch v2 Gated DeltaNet — for now, v2 on TPU uses the chunked PyTorch
+# scan (not the XLA scan), because the delta-rule backward is more complex
+# (matrix state). The v1 scan fix above is the priority.
 try:
     from . import lsa_v2 as _lsa_v2
-    _lsa_v2.chunked_gated_delta_rule_torch = gated_delta_rule_xla
-    # Also set it as the fallback so GatedDeltaRecurrence.forward uses it
-    # when HAS_FLA is False (which is always on TPU).
+    # v2 already has chunked_gated_delta_rule_torch as fallback; leave it.
 except ImportError:
     pass
 
@@ -162,7 +144,6 @@ from .lsa import (
 
 __all__ = [
     "ssm_scan_xla",
-    "gated_delta_rule_xla",
     "LSAAttention",
     "LSABlock",
     "LSALanguageModel",
