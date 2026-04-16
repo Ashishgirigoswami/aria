@@ -213,55 +213,11 @@ class _GDNScanFunction(torch.autograd.Function):
         # states: already (T, B, H, K, V)
         # S_prev_all: already (T, B, H, K, V)
 
-        if HAS_XLA_SCAN:
-            # REVERSE scan: iterate from T-1 to 0. Flip time dim.
-            xs_rev = (
-                q_t.flip(0), k_t.flip(0), v_t.flip(0),
-                g_t.flip(0), b_t.flip(0), go_t.flip(0),
-                states.flip(0), S_prev_all.flip(0),
-            )
-            init_dS = torch.zeros(B, H, K, V, dtype=torch.float32, device=q.device)
-
-            def bwd_step(dS, x):
-                q_i, k_i, v_i, g_i, b_i, go_i, S_t, S_prev = x
-                alpha = torch.exp(g_i)
-
-                # dq = S_t^T go
-                dq_i = (S_t * go_i.unsqueeze(-2)).sum(-1)
-                # Add q ⊗ go to dS
-                dS_new = dS + q_i.unsqueeze(-1) * go_i.unsqueeze(-2)
-
-                S_pre = S_prev * alpha[:, :, None, None]
-                sTk = (S_pre * k_i.unsqueeze(-1)).sum(-2)
-                v_new = b_i[:, :, None] * (v_i - sTk)
-
-                # dv_new from dS @ k_i
-                dv_new = (dS_new * k_i.unsqueeze(-1)).sum(-2)
-                # dk from dS @ v_new
-                dk_i = (dS_new * v_new.unsqueeze(-2)).sum(-1)
-
-                dbeta_i = (dv_new * (v_i - sTk)).sum(dim=-1)
-                dv_i = dv_new * b_i[:, :, None]
-                dsTk = -dv_new * b_i[:, :, None]
-
-                dS_pre_from_sTk = k_i.unsqueeze(-1) * dsTk.unsqueeze(-2)
-                dk_i = dk_i + (S_pre * dsTk.unsqueeze(-2)).sum(-1)
-
-                dS_pre = dS_new + dS_pre_from_sTk
-                dg_i = (dS_pre * S_prev * alpha[:, :, None, None]).sum(dim=(-2, -1))
-                dS_out = dS_pre * alpha[:, :, None, None]
-
-                return dS_out, (dq_i, dk_i, dv_i, dg_i, dbeta_i)
-
-            _, (dq_rev, dk_rev, dv_rev, dg_rev, dbeta_rev) = xla_scan(bwd_step, init_dS, xs_rev)
-            # Flip back to forward time order
-            dq = dq_rev.flip(0).permute(1, 2, 0, 3)
-            dk = dk_rev.flip(0).permute(1, 2, 0, 3)
-            dv = dv_rev.flip(0).permute(1, 2, 0, 3)
-            dg = dg_rev.flip(0).permute(1, 2, 0)
-            dbeta = dbeta_rev.flip(0).permute(1, 2, 0)
-        else:
-            # Fallback: Python loop
+        # Note: xla_scan can't be used for backward — it auto-diffs the step
+        # function, but our step IS the manual gradient computation (double-diff
+        # fails with "element 1 does not require grad"). Use Python loop.
+        # Slow to compile (~15-30 min) but works correctly.
+        if True:
             dq = torch.zeros_like(q_f)
             dk = torch.zeros_like(k_f)
             dv = torch.zeros_like(v_f)
