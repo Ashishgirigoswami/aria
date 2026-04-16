@@ -226,13 +226,59 @@ class LSABlock(nn.Module):
         return x
 
 
+class _ManualCausalAttention(nn.Module):
+    """Causal multi-head attention using manual matmul + mask + softmax.
+
+    Functionally identical to CausalAttention (baseline.py) but avoids
+    F.scaled_dot_product_attention which has backward issues on XLA at
+    seq_len >= 256. Uses the same matmul + tril mask approach as LSA's
+    local attention path, which is confirmed working on TPU.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.w_q = nn.Linear(d_model, d_model, bias=False)
+        self.w_k = nn.Linear(d_model, d_model, bias=False)
+        self.w_v = nn.Linear(d_model, d_model, bias=False)
+        self.w_o = nn.Linear(d_model, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor,
+                rope_cos: torch.Tensor, rope_sin: torch.Tensor) -> torch.Tensor:
+        B, T, D = x.shape
+        H, Dh = self.n_heads, self.d_head
+        q = self.w_q(x).view(B, T, H, Dh)
+        k = self.w_k(x).view(B, T, H, Dh)
+        v = self.w_v(x).view(B, T, H, Dh)
+        q, k = apply_rope(q, k, rope_cos, rope_sin)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        scale = 1.0 / math.sqrt(Dh)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+        causal_mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
+        scores = scores.masked_fill(~causal_mask.view(1, 1, T, T), float('-inf'))
+        attn = F.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous().view(B, T, D)
+        return self.w_o(out)
+
+
 class _FullAttentionBlock(nn.Module):
-    """Vanilla transformer block used in interleaved slots of LSA v1."""
+    """Vanilla transformer block used in interleaved slots of LSA v1.
+
+    Uses _ManualCausalAttention instead of CausalAttention (which relies
+    on F.scaled_dot_product_attention) for XLA/TPU compatibility.
+    """
 
     def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.0):
         super().__init__()
         self.norm1 = RMSNorm(d_model)
-        self.attn = CausalAttention(d_model, n_heads, dropout)
+        self.attn = _ManualCausalAttention(d_model, n_heads, dropout)
         self.norm2 = RMSNorm(d_model)
         self.mlp = SwiGLU(d_model, d_ff, dropout)
 

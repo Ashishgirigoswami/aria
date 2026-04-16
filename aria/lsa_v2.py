@@ -485,12 +485,17 @@ class LSAv2Block(nn.Module):
 
 
 class FullAttentionBlock(nn.Module):
-    """Vanilla transformer block — used in interleaved slots."""
+    """Vanilla transformer block — used in interleaved slots.
+
+    Uses _ManualCausalAttention from lsa.py for XLA/TPU compatibility
+    (F.scaled_dot_product_attention backward is broken on XLA at seq_len>=256).
+    """
 
     def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.0):
         super().__init__()
+        from .lsa import _ManualCausalAttention
         self.norm1 = RMSNorm(d_model)
-        self.attn = CausalAttention(d_model, n_heads, dropout)
+        self.attn = _ManualCausalAttention(d_model, n_heads, dropout)
         self.norm2 = RMSNorm(d_model)
         self.mlp = SwiGLU(d_model, d_ff, dropout)
 
