@@ -1,0 +1,52 @@
+# ARIA Phase 2b: 150M target architecture — the headline run
+# LSA v2 (Gated DeltaNet) + 3:1 interleaved attention + QK-Norm + WSD + FineWeb-Edu
+# Mirrors Qwen3-Next's 3:1 GDN+Attention hybrid, differentiated by:
+#   - Shared MLA latent c_kv driving both KV path AND GDN input
+#   - Joint softmax with state-derived virtual K
+model:
+  name: lsa_v2
+  vocab_size: 50257             # gpt2 BPE
+  d_model: 768                  # standard 150M width (like GPT-2 small)
+  n_layers: 12                  # 12 layers, 9 LSA + 3 full attention at 3:1
+  n_heads: 12
+  d_head: 64
+  d_ff: 2200                    # tuned for ~150M params total
+  d_kv_latent: 384              # MLA compression = d_model / 2
+  d_state: 192                  # GDN matrix state dim
+  max_seq_len: 2048
+  dropout: 0.0
+  rope_base: 10000.0
+  tie_weights: true
+  interleave_ratio: 3           # every 4th block is pure attention
+
+data:
+  dataset: fineweb-edu          # high-quality web corpus
+  tokenizer: bpe
+  cache_dir: ./data
+  seq_len: 2048                 # 4x Phase 1 context
+  train_split: 0.98             # small val slice
+  max_train_tokens: 3000000000  # 3B tokens = 20x Chinchilla ratio for 150M
+
+training:
+  batch_size: 16
+  grad_accum_steps: 4           # effective batch 64
+  max_steps: 25000              # 25k * 64 * 2048 = 3.28B tokens seen
+  eval_every: 500
+  eval_iters: 50
+  warmup_steps: 1000
+  lr: 6.0e-4
+  min_lr: 6.0e-5
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+  amp: true
+  device: auto
+  seed: 42
+  lr_schedule: wsd              # Warmup-Stable-Decay (frontier standard)
+  wsd_decay_start: 0.8          # last 20% is decay phase
+
+logging:
+  run_name: aria_v2_150m_fwe
+  checkpoint_dir: ./checkpoints/aria_v2_150m_fwe
+  log_every: 50
