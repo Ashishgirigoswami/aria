@@ -1,0 +1,45 @@
+# Mamba-3 baseline for Kaggle T4x2 (CUDA, fp16).
+# Direct comparison point for ARIA v1 (131M vector-SSM hybrid).
+model:
+  name: mamba3
+  vocab_size: 50257
+  d_model: 768
+  n_layers: 12
+  d_state: 128
+  headdim: 64
+  mimo_rank: 4
+  chunk_size: 16
+  max_seq_len: 256
+  tie_weights: true
+
+data:
+  dataset: wikitext-103
+  tokenizer: bpe
+  cache_dir: ./data
+  seq_len: 256
+  train_split: 0.98
+  max_train_tokens: 50000000
+
+training:
+  batch_size: 8                 # T4 has 16GB, fits batch=8 w/ fp16
+  grad_accum_steps: 8           # effective batch 64
+  max_steps: 8000
+  eval_every: 400
+  eval_iters: 50
+  warmup_steps: 500
+  lr: 6.0e-4
+  min_lr: 6.0e-5
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+  seed: 42
+  lr_schedule: wsd
+  wsd_decay_start: 0.8
+  ckpt_every: 100               # T4 Kaggle 9hr session — save often
+  dtype: fp16                   # T4 Turing has no bf16
+
+logging:
+  run_name: mamba3_150m_kaggle
+  checkpoint_dir: /kaggle/working/checkpoints/mamba3_150m_kaggle
+  log_every: 25
