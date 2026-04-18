@@ -35,11 +35,18 @@ from .lsa import (
 from .nn_utils import RMSNorm, SwiGLU
 
 try:
-    from mamba_ssm.modules.mamba3 import Mamba3 as _Mamba3
-    HAS_MAMBA3 = True
+    from mamba_ssm.modules.mamba3 import Mamba3 as _MambaImpl
+    HAS_MAMBA = True
+    MAMBA_VARIANT = "mamba3"
 except ImportError:
-    _Mamba3 = None
-    HAS_MAMBA3 = False
+    try:
+        from mamba_ssm import Mamba2 as _MambaImpl
+        HAS_MAMBA = True
+        MAMBA_VARIANT = "mamba2"
+    except ImportError:
+        _MambaImpl = None
+        HAS_MAMBA = False
+        MAMBA_VARIANT = None
 
 
 class LSAMamba3Block(nn.Module):
@@ -61,7 +68,7 @@ class LSAMamba3Block(nn.Module):
                  is_mimo: bool = False, mimo_rank: int = 4,
                  qk_norm: bool = False):
         super().__init__()
-        if not HAS_MAMBA3:
+        if not HAS_MAMBA:
             raise RuntimeError(
                 "mamba-ssm not installed. Install with "
                 "`pip install mamba-ssm causal-conv1d` on a CUDA box."
@@ -117,16 +124,26 @@ class _LSAMamba3Attention(nn.Module):
         self.w_k_up = nn.Linear(d_kv_latent, d_model, bias=False)
         self.w_v_up = nn.Linear(d_kv_latent, d_model, bias=False)
 
-        # Mamba-3 SSM takes the MLA latent (shared input) and produces
-        # a per-timestep readout of shape (B, T, d_kv_latent).
-        self.mamba3 = _Mamba3(
-            d_model=d_kv_latent,
-            d_state=d_state,
-            headdim=mamba3_headdim,
-            is_mimo=is_mimo,
-            mimo_rank=mimo_rank,
-            chunk_size=mamba3_chunk_size,
-        )
+        # SSM backbone — Mamba-3 preferred, Mamba-2 fallback if PyPI release lacks Mamba-3.
+        # Takes the MLA latent (shared input), returns per-timestep readout (B, T, d_kv_latent).
+        if MAMBA_VARIANT == "mamba3":
+            self.mamba3 = _MambaImpl(
+                d_model=d_kv_latent,
+                d_state=d_state,
+                headdim=mamba3_headdim,
+                is_mimo=is_mimo,
+                mimo_rank=mimo_rank,
+                chunk_size=mamba3_chunk_size,
+            )
+        else:  # mamba2 fallback
+            self.mamba3 = _MambaImpl(
+                d_model=d_kv_latent,
+                d_state=d_state,
+                d_conv=4,
+                expand=2,
+                headdim=mamba3_headdim,
+                chunk_size=256,
+            )
 
         # Project Mamba-3 readout to per-position K, V "virtual tokens"
         self.w_state_k = nn.Linear(d_kv_latent, d_model, bias=False)
