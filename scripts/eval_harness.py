@@ -56,12 +56,27 @@ from aria.baseline import BaselineLanguageModel
 from aria.lsa import LSALanguageModel
 from aria.lsa_v2 import LSAv2LanguageModel
 
+# Mamba variants require CUDA (mamba-ssm kernels). Load lazily so TPU/CPU eval
+# of LSA v1 still works without mamba-ssm installed.
+try:
+    from aria.mamba3_model import Mamba3LanguageModel
+except Exception:
+    Mamba3LanguageModel = None
+try:
+    from aria.lsa_mamba3 import LSAMamba3LanguageModel
+except Exception:
+    LSAMamba3LanguageModel = None
+
 
 MODEL_REGISTRY = {
     "lsa": LSALanguageModel,
     "lsa_v2": LSAv2LanguageModel,
     "baseline": BaselineLanguageModel,
 }
+if Mamba3LanguageModel is not None:
+    MODEL_REGISTRY["mamba3"] = Mamba3LanguageModel
+if LSAMamba3LanguageModel is not None:
+    MODEL_REGISTRY["lsa_mamba3"] = LSAMamba3LanguageModel
 
 
 def load_model(ckpt_path: str, config_path: str, device) -> torch.nn.Module:
