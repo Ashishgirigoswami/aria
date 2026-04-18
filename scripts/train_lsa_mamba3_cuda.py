@@ -86,6 +86,12 @@ def main() -> None:
     print(f"Model: LSA+Mamba-3 {n_params/1e6:.2f}M on {device} "
           f"(params={next(model.parameters()).dtype}, amp={dtype})")
 
+    # Multi-GPU via DataParallel if requested and >1 GPU available
+    use_multi_gpu = cfg["training"].get("multi_gpu", False) and torch.cuda.device_count() > 1
+    if use_multi_gpu:
+        print(f"DataParallel across {torch.cuda.device_count()} GPUs")
+        model = torch.nn.DataParallel(model)
+
     opt = torch.optim.AdamW(
         model.parameters(),
         lr=cfg["training"]["lr"],
@@ -108,7 +114,7 @@ def main() -> None:
     best_val = float("inf")
     if resume_path and Path(resume_path).exists():
         state = torch.load(resume_path, map_location="cpu", weights_only=False)
-        model.load_state_dict(state["model"])
+        (model.module if hasattr(model, "module") else model).load_state_dict(state["model"])
         opt.load_state_dict(state["optimizer"])
         if scaler is not None and "scaler" in state and state["scaler"]:
             scaler.load_state_dict(state["scaler"])
@@ -120,8 +126,12 @@ def main() -> None:
     t0 = time.time()
 
     def save_ckpt(tag: str, step_val: int) -> None:
+        model_state = (
+            model.module.state_dict()
+            if hasattr(model, "module") else model.state_dict()
+        )
         torch.save({
-            "model": model.state_dict(),
+            "model": model_state,
             "optimizer": opt.state_dict(),
             "scaler": scaler.state_dict() if scaler else None,
             "step": step_val,
@@ -136,6 +146,8 @@ def main() -> None:
             x, y = val_sampler.sample()
             with torch.amp.autocast(device_type="cuda", dtype=dtype):
                 _, loss = model(x, y)
+                if loss.dim() > 0:
+                    loss = loss.mean()  # DataParallel returns per-device scalar tensor
             losses.append(loss.item())
         model.train()
         return sum(losses) / len(losses)
@@ -154,6 +166,8 @@ def main() -> None:
             x, y = train_sampler.sample()
             with torch.amp.autocast(device_type="cuda", dtype=dtype):
                 _, loss = model(x, y)
+                if loss.dim() > 0:
+                    loss = loss.mean()  # DataParallel returns per-device scalar tensor
                 loss = loss / tc["grad_accum_steps"]
             total_loss += loss.item() * tc["grad_accum_steps"]
             if scaler is not None:
