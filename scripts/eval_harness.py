@@ -44,6 +44,14 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+# Patch SSM scan for XLA before importing the model — same trick the trainer uses.
+try:
+    import torch_xla
+    HAS_XLA = True
+    from aria import lsa_xla  # noqa: F401  (side-effect: monkey-patches SSM scan)
+except ImportError:
+    HAS_XLA = False
+
 from aria.baseline import BaselineLanguageModel
 from aria.lsa import LSALanguageModel
 from aria.lsa_v2 import LSAv2LanguageModel
@@ -56,8 +64,7 @@ MODEL_REGISTRY = {
 }
 
 
-def load_model(ckpt_path: str, config_path: str, device: str = "cuda"
-               ) -> torch.nn.Module:
+def load_model(ckpt_path: str, config_path: str, device) -> torch.nn.Module:
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
     model_cfg = dict(cfg["model"])
@@ -67,6 +74,10 @@ def load_model(ckpt_path: str, config_path: str, device: str = "cuda"
     state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     model.load_state_dict(state["model"] if "model" in state else state)
     model.to(device).eval()
+    # Re-tie weights post-.to() — XLA can break tied params.
+    if hasattr(model, "lm_head") and hasattr(model, "token_emb"):
+        if model.lm_head.weight is not model.token_emb.weight:
+            model.lm_head.weight = model.token_emb.weight
     return model
 
 
@@ -124,6 +135,8 @@ class ARIALMWrapper:
             target_ids = torch.tensor([all_ids[1:]], device=self.device)
 
             logits, _ = self.model(input_ids)
+            if HAS_XLA and str(self.device).startswith("xla"):
+                torch_xla.sync()
             log_probs = torch.log_softmax(logits.float(), dim=-1)
             # Slice the continuation positions only
             n_cont = len(cont_ids)
@@ -149,6 +162,8 @@ class ARIALMWrapper:
             input_ids = torch.tensor([ids[:-1]], device=self.device)
             target_ids = torch.tensor([ids[1:]], device=self.device)
             logits, _ = self.model(input_ids)
+            if HAS_XLA and str(self.device).startswith("xla"):
+                torch_xla.sync()
             log_probs = torch.log_softmax(logits.float(), dim=-1)
             gathered = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
             results.append(float(gathered.sum().cpu()))
@@ -206,17 +221,34 @@ def main() -> None:
     parser.add_argument("--num-fewshot", type=int, default=0)
     parser.add_argument("--limit", type=int, default=None,
                         help="Limit docs per task (for smoke testing)")
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", default="auto",
+                        help="auto | cuda | cpu | xla")
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--output", default="eval_results.json")
     args = parser.parse_args()
 
-    print(f"Loading model from {args.ckpt} on {args.device}...")
-    model = load_model(args.ckpt, args.config, args.device)
+    if args.device == "auto":
+        if HAS_XLA:
+            device = torch_xla.device()
+        elif torch.cuda.is_available():
+            device = torch.device("cuda")
+        else:
+            device = torch.device("cpu")
+    elif args.device == "xla":
+        if not HAS_XLA:
+            raise RuntimeError("--device xla requested but torch_xla not installed")
+        device = torch_xla.device()
+    else:
+        device = torch.device(args.device)
+
+    print(f"Loading model from {args.ckpt} on {device}...")
+    model = load_model(args.ckpt, args.config, device)
+    if HAS_XLA and str(device).startswith("xla"):
+        torch_xla.sync()
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model loaded. Parameters: {n_params:,} ({n_params/1e6:.2f}M)")
 
-    wrapper = ARIALMWrapper(model, max_length=args.max_length, device=args.device)
+    wrapper = ARIALMWrapper(model, max_length=args.max_length, device=device)
 
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
     print(f"Running tasks: {tasks} (num_fewshot={args.num_fewshot})")
