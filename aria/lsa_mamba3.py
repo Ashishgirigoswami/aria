@@ -30,7 +30,7 @@ from .lsa import (
     LSAAttention,
     _FullAttentionBlock,
     apply_rope,
-    build_rope_cache,
+    precompute_rope,
 )
 from .nn_utils import RMSNorm, SwiGLU
 
@@ -250,7 +250,7 @@ class LSAMamba3LanguageModel(nn.Module):
         if tie_weights:
             self.lm_head.weight = self.token_emb.weight
 
-        rope_cos, rope_sin = build_rope_cache(max_seq_len, d_head, base=rope_base)
+        rope_cos, rope_sin = precompute_rope(d_head, max_seq_len, base=rope_base)
         self.register_buffer("rope_cos", rope_cos, persistent=False)
         self.register_buffer("rope_sin", rope_sin, persistent=False)
 
