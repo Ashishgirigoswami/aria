@@ -91,7 +91,7 @@ class ARIALMWrapper:
 
     def __init__(self, model: torch.nn.Module, tokenizer_name: str = "gpt2",
                  max_length: int = 2048, device: str = "cuda",
-                 batch_size: int = 8):
+                 batch_size: int = 8, pad_to_max: bool = False):
         import tiktoken
         self.model = model
         self.tokenizer = tiktoken.get_encoding(tokenizer_name)
@@ -99,6 +99,12 @@ class ARIALMWrapper:
         self.device = device
         self.batch_size = batch_size
         self.eot_token_id = self.tokenizer.eot_token
+        # On XLA devices we MUST pad to a fixed length to avoid recompile per shape.
+        is_xla = HAS_XLA and str(device).startswith("xla")
+        self.pad_to_max = pad_to_max or is_xla
+        if self.pad_to_max:
+            print(f"  pad_to_max enabled (input length fixed at {max_length}) — "
+                  "single XLA compile, post-process on CPU")
 
     @property
     def vocab_size(self) -> int:
@@ -120,32 +126,59 @@ class ARIALMWrapper:
         gathered = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
         return gathered
 
+    def _pad_ids(self, ids: list[int]) -> list[int]:
+        """Truncate-or-pad to exactly max_length tokens. Pad with EOT."""
+        ids = ids[-self.max_length:]
+        return ids + [self.eot_token_id] * (self.max_length - len(ids))
+
     @torch.no_grad()
     def loglikelihood(self, requests: list[tuple[str, str]]
                       ) -> list[tuple[float, bool]]:
         """requests: list of (context, continuation). Return list of (logp, is_greedy)."""
         results: list[tuple[float, bool]] = []
-        for ctx, cont in requests:
+        is_xla = HAS_XLA and str(self.device).startswith("xla")
+        try:
+            from tqdm import tqdm
+            iterator = tqdm(requests, desc="loglikelihood", leave=False)
+        except ImportError:
+            iterator = requests
+
+        for ctx, cont in iterator:
             ctx_ids = self.tok_encode(ctx) if ctx else [self.eot_token_id]
             cont_ids = self.tok_encode(cont)
-            all_ids = ctx_ids + cont_ids
-            if len(all_ids) > self.max_length:
-                all_ids = all_ids[-self.max_length:]
-            input_ids = torch.tensor([all_ids[:-1]], device=self.device)
-            target_ids = torch.tensor([all_ids[1:]], device=self.device)
+            all_ids = (ctx_ids + cont_ids)[-self.max_length:]
+            n = len(all_ids)
+            n_cont = min(len(cont_ids), n - 1)
 
-            logits, _ = self.model(input_ids)
-            if HAS_XLA and str(self.device).startswith("xla"):
-                torch_xla.sync()
-            log_probs = torch.log_softmax(logits.float(), dim=-1)
-            # Slice the continuation positions only
-            n_cont = len(cont_ids)
-            cont_log_probs = log_probs[0, -n_cont:]
-            cont_targets = target_ids[0, -n_cont:]
-            gathered = cont_log_probs.gather(-1, cont_targets.unsqueeze(-1)).squeeze(-1)
-            total_logp = float(gathered.sum().cpu())
-            # Greedy check: argmax at each continuation position matches target?
-            is_greedy = bool((cont_log_probs.argmax(-1) == cont_targets).all().cpu())
+            if self.pad_to_max:
+                # Always-fixed shape (1, max_length-1) → single XLA compile
+                padded = self._pad_ids(all_ids)
+                input_ids = torch.tensor([padded[:-1]], device=self.device)
+                logits, _ = self.model(input_ids)
+                if is_xla:
+                    torch_xla.sync()
+                # Move to CPU, then slice on CPU (no recompile)
+                logits_cpu = logits.float().cpu()
+                # Real positions in padded are 0..n-2 in the input/target.
+                # Continuation occupies last n_cont positions → indices [n-1-n_cont:n-1] of target
+                cont_log_probs = torch.log_softmax(
+                    logits_cpu[0, n - 1 - n_cont : n - 1], dim=-1
+                )
+                cont_targets = torch.tensor(all_ids[n - n_cont : n], dtype=torch.long)
+            else:
+                input_ids = torch.tensor([all_ids[:-1]], device=self.device)
+                target_ids = torch.tensor([all_ids[1:]], device=self.device)
+                logits, _ = self.model(input_ids)
+                cont_log_probs = torch.log_softmax(
+                    logits[0, -n_cont:].float(), dim=-1
+                ).cpu()
+                cont_targets = target_ids[0, -n_cont:].cpu()
+
+            gathered = cont_log_probs.gather(
+                -1, cont_targets.unsqueeze(-1)
+            ).squeeze(-1)
+            total_logp = float(gathered.sum())
+            is_greedy = bool((cont_log_probs.argmax(-1) == cont_targets).all())
             results.append((total_logp, is_greedy))
         return results
 
@@ -153,20 +186,46 @@ class ARIALMWrapper:
     def loglikelihood_rolling(self, requests: list[str]) -> list[float]:
         """Rolling log-likelihood over a full string (for LAMBADA, wikitext ppl)."""
         results: list[float] = []
-        for text in requests:
+        is_xla = HAS_XLA and str(self.device).startswith("xla")
+        try:
+            from tqdm import tqdm
+            iterator = tqdm(requests, desc="loglikelihood_rolling", leave=False)
+        except ImportError:
+            iterator = requests
+
+        for text in iterator:
             ids = self.tok_encode(text)
             if len(ids) < 2:
                 results.append(0.0)
                 continue
             ids = ids[:self.max_length]
-            input_ids = torch.tensor([ids[:-1]], device=self.device)
-            target_ids = torch.tensor([ids[1:]], device=self.device)
-            logits, _ = self.model(input_ids)
-            if HAS_XLA and str(self.device).startswith("xla"):
-                torch_xla.sync()
-            log_probs = torch.log_softmax(logits.float(), dim=-1)
-            gathered = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
-            results.append(float(gathered.sum().cpu()))
+            n = len(ids)
+
+            if self.pad_to_max:
+                padded = self._pad_ids(ids)
+                input_ids = torch.tensor([padded[:-1]], device=self.device)
+                logits, _ = self.model(input_ids)
+                if is_xla:
+                    torch_xla.sync()
+                logits_cpu = logits.float().cpu()
+                # Real positions are 0..n-2; targets are ids[1:n]
+                real_log_probs = torch.log_softmax(
+                    logits_cpu[0, : n - 1], dim=-1
+                )
+                real_targets = torch.tensor(ids[1:n], dtype=torch.long)
+                gathered = real_log_probs.gather(
+                    -1, real_targets.unsqueeze(-1)
+                ).squeeze(-1)
+                results.append(float(gathered.sum()))
+            else:
+                input_ids = torch.tensor([ids[:-1]], device=self.device)
+                target_ids = torch.tensor([ids[1:]], device=self.device)
+                logits, _ = self.model(input_ids)
+                log_probs = torch.log_softmax(logits.float(), dim=-1)
+                gathered = log_probs.gather(
+                    -1, target_ids.unsqueeze(-1)
+                ).squeeze(-1)
+                results.append(float(gathered.sum().cpu()))
         return results
 
 
@@ -223,7 +282,10 @@ def main() -> None:
                         help="Limit docs per task (for smoke testing)")
     parser.add_argument("--device", default="auto",
                         help="auto | cuda | cpu | xla")
-    parser.add_argument("--max-length", type=int, default=2048)
+    parser.add_argument("--max-length", type=int, default=256,
+                        help="Default 256 = ARIA training context. Required for XLA.")
+    parser.add_argument("--pad-to-max", action="store_true",
+                        help="Pad all inputs to max_length (auto-on for XLA)")
     parser.add_argument("--output", default="eval_results.json")
     args = parser.parse_args()
 
@@ -248,7 +310,8 @@ def main() -> None:
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model loaded. Parameters: {n_params:,} ({n_params/1e6:.2f}M)")
 
-    wrapper = ARIALMWrapper(model, max_length=args.max_length, device=device)
+    wrapper = ARIALMWrapper(model, max_length=args.max_length, device=device,
+                            pad_to_max=args.pad_to_max)
 
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
     print(f"Running tasks: {tasks} (num_fewshot={args.num_fewshot})")
