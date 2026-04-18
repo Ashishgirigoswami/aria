@@ -1,0 +1,55 @@
+# ARIA v1 160M on FineWeb-Edu 500M tokens — direct Pythia-160M comparison
+# Bumped from 131M (12 layers) to ~153M (15 layers) keeping all block shapes.
+# Data: FineWeb-Edu sample-10BT subset, 500M BPE tokens.
+# Token budget: ~10x more than our wikitext 131M run.
+# Expected: beat Pythia-160M on ARC-E, match on HellaSwag.
+
+model:
+  name: lsa
+  vocab_size: 50257
+  d_model: 768
+  n_layers: 15                   # ← bumped from 12 for 160M
+  n_heads: 12
+  d_head: 64
+  d_ff: 2200
+  d_kv_latent: 384
+  d_state: 192
+  max_seq_len: 256
+  dropout: 0.0
+  rope_base: 10000.0
+  tie_weights: true
+  interleave_ratio: 3            # 12 LSA + 3 full-attn blocks (pattern: 3:1)
+  qk_norm: false
+
+data:
+  dataset: fineweb-edu           # ← not wikitext-103
+  tokenizer: bpe
+  cache_dir: ./data
+  seq_len: 256
+  train_split: 0.99
+  max_train_tokens: 500000000    # 500M BPE tokens
+
+training:
+  batch_size: 4
+  grad_accum_steps: 16           # effective batch 64 (same as v1 131M)
+  max_steps: 30000               # 30K × 16K tok/step = 480M token-views
+  eval_every: 1000
+  eval_iters: 50
+  warmup_steps: 1000             # longer warmup for deeper model
+  lr: 6.0e-4
+  min_lr: 6.0e-5
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+  amp: true
+  device: auto
+  seed: 42
+  lr_schedule: wsd
+  wsd_decay_start: 0.8           # decay from step 24K
+  ckpt_every: 200                # spot preemption insurance
+
+logging:
+  run_name: aria_v1_160m_fwe_500m
+  checkpoint_dir: ./checkpoints/aria_v1_160m_fwe_500m
+  log_every: 50
