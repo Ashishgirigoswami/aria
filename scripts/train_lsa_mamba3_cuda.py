@@ -76,9 +76,15 @@ def main() -> None:
 
     dtype_str = cfg["training"].get("dtype", "bf16")
     dtype = torch.bfloat16 if dtype_str == "bf16" else torch.float16
-    model = model.to(device).to(dtype)
+    # For fp16 + GradScaler, keep PARAMS in fp32 (grads must be fp32 to unscale).
+    # For bf16, we can cast params to bf16 directly (no GradScaler used).
+    if dtype == torch.bfloat16:
+        model = model.to(device).to(dtype)
+    else:  # fp16: params stay fp32, autocast casts in forward only
+        model = model.to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model: LSA+Mamba-3 {n_params/1e6:.2f}M on {device} ({dtype})")
+    print(f"Model: LSA+Mamba-3 {n_params/1e6:.2f}M on {device} "
+          f"(params={next(model.parameters()).dtype}, amp={dtype})")
 
     opt = torch.optim.AdamW(
         model.parameters(),
