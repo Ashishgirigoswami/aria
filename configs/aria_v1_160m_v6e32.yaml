@@ -1,0 +1,57 @@
+## ARIA v1 160M — v6e-32 port of the 160M FWE recipe
+##
+## Same model, same recipe, same 500M-token budget, same 30K steps as the
+## v4-32 run. Preserves effective batch = 64 (batch=2 × world=32).
+##
+## Expected wallclock on v6e-32: ~5-6 h (v4-32 was 16.3 h).
+## v6e is ~2× v4 throughput; 32 v6e chips ≈ 4× v4-32 throughput.
+
+model:
+  name: lsa
+  vocab_size: 50257
+  d_model: 768
+  n_layers: 15
+  n_heads: 12
+  d_head: 64
+  d_ff: 2200
+  d_kv_latent: 384
+  d_state: 192
+  max_seq_len: 256
+  dropout: 0.0
+  rope_base: 10000.0
+  tie_weights: true
+  interleave_ratio: 3
+  qk_norm: false
+
+data:
+  dataset: fineweb-edu
+  tokenizer: bpe
+  cache_dir: ./data
+  seq_len: 256
+  train_split: 0.99
+  max_train_tokens: 500000000
+
+training:
+  batch_size: 2                  # PER-CHIP; 32 chips → effective 64 (same recipe)
+  grad_accum_steps: 1
+  max_steps: 30000
+  eval_every: 999999             # disabled; eval post-hoc
+  eval_iters: 50
+  warmup_steps: 1000
+  lr: 6.0e-4
+  min_lr: 6.0e-5
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+  amp: true
+  device: auto
+  seed: 42
+  lr_schedule: wsd
+  wsd_decay_start: 0.8
+  ckpt_every: 500
+
+logging:
+  run_name: aria_v1_160m_v6e32
+  checkpoint_dir: ./checkpoints/aria_v1_160m_v6e32
+  log_every: 50
