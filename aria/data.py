@@ -221,7 +221,7 @@ def load_fineweb_edu(cache_dir: str | Path, max_train_tokens: int | None = None,
             return all_text[:split_point], all_text[split_point:]
 
     attempt = 0
-    skip_docs = 0  # rough resume position (doc count)
+    skip_docs = 0  # resume position = number of docs flushed to partial_path
     while attempt < max_retries and len(all_text) < target_chars:
         try:
             ds = load_dataset(
@@ -231,10 +231,16 @@ def load_fineweb_edu(cache_dir: str | Path, max_train_tokens: int | None = None,
                 streaming=True,
                 cache_dir=str(cache_dir),
             )
-            pieces: list[str] = [all_text] if all_text else []
+            # State committed to disk so far. `all_text` is the resumable
+            # snapshot; `pieces` accumulates new documents on top. On a crash
+            # we rewind to `all_text` + matching `skip_docs`, so every
+            # document in `all_text` was read from the stream, and no
+            # document past that has been counted yet.
+            pieces: list[str] = []
+            committed_text = all_text
+            committed_docs = skip_docs
             total_chars = len(all_text)
             doc_count = 0
-            last_checkpoint_chars = total_chars
             for row in ds:
                 doc_count += 1
                 if doc_count <= skip_docs:
@@ -246,23 +252,31 @@ def load_fineweb_edu(cache_dir: str | Path, max_train_tokens: int | None = None,
                 total_chars += len(t)
                 if total_chars >= target_chars:
                     break
-                if total_chars - last_checkpoint_chars >= 50_000_000:
-                    partial_path.write_text("".join(pieces), encoding="utf-8")
-                    last_checkpoint_chars = total_chars
+                # Atomic-ish checkpoint: advance BOTH the text snapshot and
+                # the doc counter together, so a subsequent failure resumes
+                # from a consistent point.
+                if total_chars - len(committed_text) >= 50_000_000:
+                    committed_text = committed_text + "".join(pieces)
+                    pieces = []
+                    committed_docs = doc_count
+                    partial_path.write_text(committed_text, encoding="utf-8")
                     print(f"  checkpointed at {total_chars:,} chars "
                           f"(doc {doc_count:,})", flush=True)
                 if doc_count % 10000 == 0:
                     print(f"  streamed doc {doc_count:,}, "
                           f"{total_chars:,} chars", flush=True)
-            all_text = "".join(pieces)
+            all_text = committed_text + "".join(pieces)
             break
         except Exception as e:
             attempt += 1
             wait = min(60, 2 ** attempt)
             print(f"  fineweb-edu stream error (attempt {attempt}/{max_retries}): "
                   f"{type(e).__name__}: {e}. Retrying in {wait}s...", flush=True)
+            # Roll back to the last committed checkpoint — never persist
+            # in-flight pieces that weren't yet accounted for in skip_docs.
+            all_text = committed_text if 'committed_text' in locals() else all_text
+            skip_docs = committed_docs if 'committed_docs' in locals() else skip_docs
             partial_path.write_text(all_text, encoding="utf-8")
-            skip_docs = doc_count if 'doc_count' in locals() else 0
             time.sleep(wait)
     else:
         if len(all_text) < target_chars * 0.5:
@@ -304,10 +318,26 @@ def build_bpe_datasets(dataset: str = "tinyshakespeare",
     cache_dir = Path(cache_dir)
     tokenizer = BPETokenizer()
 
-    bin_dir = cache_dir / "bpe_tokens" / dataset
+    # Cache is keyed by (dataset, requested token budget) so a later run with
+    # a larger budget doesn't silently reuse a smaller cache. `None` means
+    # "take whatever the upstream loader produces".
+    cache_key = dataset if max_train_tokens is None else f"{dataset}_{max_train_tokens}"
+    bin_dir = cache_dir / "bpe_tokens" / cache_key
     bin_dir.mkdir(parents=True, exist_ok=True)
     train_bin = bin_dir / "train.bin"
     val_bin = bin_dir / "val.bin"
+
+    # Backwards-compat: reuse the legacy dataset-only cache dir if it already
+    # holds at least as many tokens as this run needs. Saves re-tokenizing on
+    # machines that built a cache before the size-aware key landed.
+    if not (train_bin.exists() and val_bin.exists()):
+        legacy_dir = cache_dir / "bpe_tokens" / dataset
+        legacy_train = legacy_dir / "train.bin"
+        legacy_val = legacy_dir / "val.bin"
+        if legacy_train.exists() and legacy_val.exists():
+            legacy_size_tokens = legacy_train.stat().st_size // 4  # int32
+            if max_train_tokens is None or legacy_size_tokens >= max_train_tokens:
+                train_bin, val_bin = legacy_train, legacy_val
 
     if train_bin.exists() and val_bin.exists():
         train_arr = np.fromfile(train_bin, dtype=np.int32)
