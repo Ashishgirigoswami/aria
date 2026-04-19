@@ -13,8 +13,12 @@ set -euo pipefail
 
 POD="${1:-aria-v6e-64-us}"
 ZONE="${2:-us-east1-d}"
-CONFIG="configs/aria_v1_160m_v6e64.yaml"
-RUN_NAME="aria_v1_160m_v6e64"
+CONFIG="${3:-configs/aria_v1_160m_v6e64.yaml}"
+# Derive run_name from config file — reads logging.run_name via grep
+RUN_NAME=$(grep -E "^  run_name:" "$CONFIG" | awk '{print $2}')
+if [ -z "$RUN_NAME" ]; then
+  echo "Could not extract run_name from $CONFIG"; exit 2
+fi
 
 export PATH="/c/Program Files (x86)/Google/Cloud SDK/google-cloud-sdk/bin:$PATH"
 

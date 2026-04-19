@@ -1,0 +1,73 @@
+## ARIA v1 160M — Chinchilla-optimal training
+##
+## Target: 3.2B FineWeb-Edu tokens (20× model params, Hoffmann et al. 2022).
+## Expected wallclock on v6e-32: ~27 h training + ~8 h first-time tokenization
+## Expected wallclock on v6e-64: ~14 h training + ~8 h first-time tokenization
+##
+## Recipe identical to the 500M-token run except scaled 10×:
+##   - max_train_tokens: 500M → 3.2B (cache)
+##   - max_steps: 30K → 200K (10× longer schedule)
+##   - warmup_steps: 1K → 5K (2.5% of total, same fraction)
+##   - Effective batch: 64 (UNCHANGED — preserves learning recipe)
+##
+## Compared to ARIA-160M-500M-tokens run:
+##   - Same model architecture
+##   - Same optimizer, same LR range (6e-4 → 6e-5)
+##   - Same WSD schedule (decay at 80%)
+##   - 6.4× more data, 6.7× more gradient updates
+##
+## Expected relative improvements on Pythia-gap benchmarks (Chinchilla scaling):
+##   HellaSwag acc_norm: 28.5% → ~32-34% (closer to Pythia's 33.6%)
+##   LAMBADA ppl: 1008 → ~200-400 (still above Pythia's 18 but huge drop)
+##   PIQA acc_norm: 58.4% → ~61-62% (meets/beats Pythia's 60.5%)
+##   ARC-Easy: already winning, should hold +3-5pp over Pythia
+
+model:
+  name: lsa
+  vocab_size: 50257
+  d_model: 768
+  n_layers: 15
+  n_heads: 12
+  d_head: 64
+  d_ff: 2200
+  d_kv_latent: 384
+  d_state: 192
+  max_seq_len: 256
+  dropout: 0.0
+  rope_base: 10000.0
+  tie_weights: true
+  interleave_ratio: 3
+  qk_norm: false
+
+data:
+  dataset: fineweb-edu
+  tokenizer: bpe
+  cache_dir: ./data
+  seq_len: 256
+  train_split: 0.995
+  max_train_tokens: 3200000000      # 3.2B — Chinchilla-optimal for 160M
+
+training:
+  batch_size: 2                     # PER-CHIP (on v6e-32). Eff batch = 2*32 = 64
+  grad_accum_steps: 1
+  max_steps: 200000                 # 200K × 64 × 256 = 3.28B token-views ≈ 1 epoch
+  eval_every: 999999                # disabled; eval post-hoc
+  eval_iters: 50
+  warmup_steps: 5000                # 2.5% of total (same fraction as original 1K/30K)
+  lr: 6.0e-4
+  min_lr: 6.0e-5
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+  amp: true
+  device: auto
+  seed: 42
+  lr_schedule: wsd
+  wsd_decay_start: 0.8              # decay begins at step 160K
+  ckpt_every: 2000                  # every ~15 min on v6e-32 — 100 total ckpts
+
+logging:
+  run_name: aria_v1_160m_chinchilla
+  checkpoint_dir: ./checkpoints/aria_v1_160m_chinchilla
+  log_every: 50
