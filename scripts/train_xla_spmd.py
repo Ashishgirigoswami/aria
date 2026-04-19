@@ -246,17 +246,17 @@ def main() -> None:
 
     def evaluate() -> float:
         model.eval()
-        losses: list[float] = []
+        loss_sum = torch.zeros((), device=device)
         with torch.no_grad():
             for _ in range(tc["eval_iters"]):
                 x, y = val_sampler.sample()
                 xs.mark_sharding(x, mesh, ("data", None))
                 xs.mark_sharding(y, mesh, ("data", None))
                 _, loss = model(x, y)
-                torch_xla.sync()
-                losses.append(loss.item())
+                loss_sum = loss_sum + loss.detach()
+        torch_xla.sync()
         model.train()
-        return sum(losses) / len(losses)
+        return float((loss_sum / tc["eval_iters"]).cpu().item())
 
     def save_ckpt(tag: str, step_val: int) -> None:
         # xm.save gathers replicated params and writes once on master.
@@ -283,24 +283,26 @@ def main() -> None:
             g["lr"] = lr
 
         opt.zero_grad(set_to_none=True)
-        total_loss = 0.0
+        total_loss = torch.zeros((), device=device)
         for _ in range(tc["grad_accum_steps"]):
             x, y = train_sampler.sample()
             xs.mark_sharding(x, mesh, ("data", None))
             xs.mark_sharding(y, mesh, ("data", None))
             _, loss = model(x, y)
             loss = loss / tc["grad_accum_steps"]
-            torch_xla.sync()
-            total_loss += loss.item() * tc["grad_accum_steps"]
+            total_loss = total_loss + loss.detach() * tc["grad_accum_steps"]
             loss.backward()
-            torch_xla.sync()
+        # One sync per optimizer step (was 2× per microstep). Safe because the
+        # custom SSM autograd now stitches forward+backward in a single XLA
+        # graph; the earlier forward-side sync was a workaround we've outgrown.
 
         if tc.get("grad_clip", 0) > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), tc["grad_clip"])
         opt.step()
         xm.mark_step()
+        torch_xla.sync()
 
-        step_loss = total_loss / tc["grad_accum_steps"]
+        step_loss = float((total_loss / tc["grad_accum_steps"]).cpu().item())
         cur = step + 1
 
         if is_master and cur % cfg["logging"]["log_every"] == 0:

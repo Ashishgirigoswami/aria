@@ -1,0 +1,62 @@
+## ARIA v1 160M — v6e-64 port of the 160M FWE recipe
+##
+## Goal: reproduce aria_v1_160m_multihost.yaml (v4-32) on v6e-64 hardware.
+## Same model, same training recipe, same 500M-token budget, same 30K steps.
+## v6e chips are ~2× v4 throughput and there are 4× more of them, so
+## expected wallclock: ~3-4 h (vs 16.3 h on v4-32).
+##
+## Effective batch math (kept identical to v4-32 run):
+##   v4-32: batch=4 × world=16 × grad_accum=1 = 64 eff
+##   v6e-64: batch=1 × world=64 × grad_accum=1 = 64 eff   ← same
+##
+## Per-chip batch=1 is small; the v6e throughput win still dominates.
+
+model:
+  name: lsa
+  vocab_size: 50257
+  d_model: 768
+  n_layers: 15
+  n_heads: 12
+  d_head: 64
+  d_ff: 2200
+  d_kv_latent: 384
+  d_state: 192
+  max_seq_len: 256
+  dropout: 0.0
+  rope_base: 10000.0
+  tie_weights: true
+  interleave_ratio: 3
+  qk_norm: false
+
+data:
+  dataset: fineweb-edu
+  tokenizer: bpe
+  cache_dir: ./data
+  seq_len: 256
+  train_split: 0.99
+  max_train_tokens: 500000000
+
+training:
+  batch_size: 1                   # PER-CHIP on v6e-64 (64 chips → eff batch 64)
+  grad_accum_steps: 1
+  max_steps: 30000                # SAME as v4-32 run
+  eval_every: 999999              # disabled; run eval post-hoc (avoids XLA recompile)
+  eval_iters: 50
+  warmup_steps: 1000
+  lr: 6.0e-4
+  min_lr: 6.0e-5
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+  amp: true
+  device: auto
+  seed: 42
+  lr_schedule: wsd
+  wsd_decay_start: 0.8
+  ckpt_every: 500                 # lower IO overhead than v4-32's 200
+
+logging:
+  run_name: aria_v1_160m_v6e64
+  checkpoint_dir: ./checkpoints/aria_v1_160m_v6e64
+  log_every: 50

@@ -51,7 +51,7 @@ training:
   seed: 42
   lr_schedule: wsd
   wsd_decay_start: 0.8
-  ckpt_every: 200
+  ckpt_every: 500
 
 logging:
   run_name: aria_v1_160m_multihost
