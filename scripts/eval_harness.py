@@ -106,13 +106,13 @@ class ARIALMWrapper:
 
     def __init__(self, model: torch.nn.Module, tokenizer_name: str = "gpt2",
                  max_length: int = 2048, device: str = "cuda",
-                 batch_size: int = 8, pad_to_max: bool = False):
+                 batch_size: int = 1, pad_to_max: bool = False):
         import tiktoken
         self.model = model
         self.tokenizer = tiktoken.get_encoding(tokenizer_name)
         self.max_length = max_length
         self.device = device
-        self.batch_size = batch_size
+        self.batch_size = max(1, int(batch_size))
         self.eot_token_id = self.tokenizer.eot_token
         # On XLA devices we MUST pad to a fixed length to avoid recompile per shape.
         is_xla = HAS_XLA and str(device).startswith("xla")
@@ -149,14 +149,58 @@ class ARIALMWrapper:
     @torch.no_grad()
     def loglikelihood(self, requests: list[tuple[str, str]]
                       ) -> list[tuple[float, bool]]:
-        """requests: list of (context, continuation). Return list of (logp, is_greedy)."""
+        """requests: list of (context, continuation). Return list of (logp, is_greedy).
+
+        When ``self.pad_to_max`` is True, requests are batched ``self.batch_size``
+        at a time into a single ``(B, max_length-1)`` forward pass — dramatically
+        faster on XLA, since the shape is fixed and the compiled graph is reused.
+        """
         results: list[tuple[float, bool]] = []
         is_xla = HAS_XLA and str(self.device).startswith("xla")
         try:
             from tqdm import tqdm
-            iterator = tqdm(requests, desc="loglikelihood", leave=False)
-        except ImportError:
-            iterator = requests
+        except ImportError:  # pragma: no cover - optional dep
+            tqdm = None
+
+        # Fast path: batched forward for the pad_to_max case.
+        if self.pad_to_max and self.batch_size > 1:
+            pbar = tqdm(total=len(requests), desc="loglikelihood", leave=False) if tqdm else None
+            for start in range(0, len(requests), self.batch_size):
+                batch = requests[start : start + self.batch_size]
+                padded_batch: list[list[int]] = []
+                meta: list[tuple[int, int, list[int]]] = []  # (n, n_cont, cont_ids)
+                for ctx, cont in batch:
+                    ctx_ids = self.tok_encode(ctx) if ctx else [self.eot_token_id]
+                    cont_ids = self.tok_encode(cont)
+                    all_ids = (ctx_ids + cont_ids)[-self.max_length:]
+                    n = len(all_ids)
+                    n_cont = min(len(cont_ids), n - 1)
+                    padded_batch.append(self._pad_ids(all_ids)[:-1])
+                    meta.append((n, n_cont, all_ids[n - n_cont : n]))
+
+                input_ids = torch.tensor(padded_batch, device=self.device)
+                logits, _ = self.model(input_ids)
+                if is_xla:
+                    torch_xla.sync()
+                logits_cpu = logits.float().cpu()
+                for i, (n, n_cont, cont_target_ids) in enumerate(meta):
+                    row = logits_cpu[i, n - 1 - n_cont : n - 1]
+                    cont_log_probs = torch.log_softmax(row, dim=-1)
+                    cont_targets = torch.tensor(cont_target_ids, dtype=torch.long)
+                    gathered = cont_log_probs.gather(
+                        -1, cont_targets.unsqueeze(-1)
+                    ).squeeze(-1)
+                    total_logp = float(gathered.sum())
+                    is_greedy = bool((cont_log_probs.argmax(-1) == cont_targets).all())
+                    results.append((total_logp, is_greedy))
+                if pbar is not None:
+                    pbar.update(len(batch))
+            if pbar is not None:
+                pbar.close()
+            return results
+
+        # Original single-item path (unbatched, or non-pad_to_max).
+        iterator = tqdm(requests, desc="loglikelihood", leave=False) if tqdm else requests
 
         for ctx, cont in iterator:
             ctx_ids = self.tok_encode(ctx) if ctx else [self.eot_token_id]
@@ -301,6 +345,9 @@ def main() -> None:
                         help="Default 256 = ARIA training context. Required for XLA.")
     parser.add_argument("--pad-to-max", action="store_true",
                         help="Pad all inputs to max_length (auto-on for XLA)")
+    parser.add_argument("--batch-size", type=int, default=1,
+                        help="Batch N loglikelihood requests per forward pass "
+                        "(only effective with --pad-to-max). 16 is a good start on v4.")
     parser.add_argument("--output", default="eval_results.json")
     args = parser.parse_args()
 
@@ -326,7 +373,7 @@ def main() -> None:
     print(f"Model loaded. Parameters: {n_params:,} ({n_params/1e6:.2f}M)")
 
     wrapper = ARIALMWrapper(model, max_length=args.max_length, device=device,
-                            pad_to_max=args.pad_to_max)
+                            pad_to_max=args.pad_to_max, batch_size=args.batch_size)
 
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
     print(f"Running tasks: {tasks} (num_fewshot={args.num_fewshot})")

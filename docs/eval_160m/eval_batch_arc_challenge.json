@@ -1,0 +1,13 @@
+{
+  "n_params": 154470912,
+  "checkpoint": "checkpoints/aria_v1_160m_multihost/final.pt",
+  "num_fewshot": 0,
+  "tasks": {
+    "arc_challenge": {
+      "acc,none": 0.19795221843003413,
+      "acc_stderr,none": 0.011643990971573372,
+      "acc_norm,none": 0.2440273037542662,
+      "acc_norm_stderr,none": 0.012551447627856255
+    }
+  }
+}

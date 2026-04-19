@@ -1,0 +1,61 @@
+## ARIA v1 1B — multi-host TPU config (v4-64 = 32 chips, 8 hosts)
+## Derived from aria_v1_1b_fwe.yaml but tuned for xmp.spawn multi-chip training.
+## batch_size is PER-CHIP; effective batch = batch_size * grad_accum_steps * world_size.
+##
+## Sizing on v4-64 (32 chips):
+##   effective batch = 4 * 8 * 32 = 1024 sequences/step
+##   1024 seq * 1024 tok = ~1.05M tokens/step
+##   60K steps * 1.05M = ~63B tokens seen (well past Chinchilla-optimal for 1B)
+##
+## For v4-8 single-host smoke test: world_size=4, effective batch = 128,
+## same as the GPU config — useful to verify convergence before full pod launch.
+
+model:
+  name: lsa
+  vocab_size: 50257
+  d_model: 2048
+  n_layers: 24
+  n_heads: 16
+  d_head: 128
+  d_ff: 5504
+  d_kv_latent: 1024
+  d_state: 256
+  max_seq_len: 1024
+  dropout: 0.0
+  rope_base: 10000.0
+  tie_weights: true
+  interleave_ratio: 3
+  qk_norm: true
+
+data:
+  dataset: fineweb-edu
+  tokenizer: bpe
+  cache_dir: ./data
+  seq_len: 1024
+  train_split: 0.995
+  max_train_tokens: 10000000000      # 10B tokens — enough for 60K step @ 1M tok/step
+
+training:
+  batch_size: 4                      # PER-CHIP. On v4-64 (32 chips): 4*32=128 micro-batch
+  grad_accum_steps: 8                # effective batch 1024 seqs on v4-64
+  max_steps: 60000
+  eval_every: 1000
+  eval_iters: 50
+  warmup_steps: 2000
+  lr: 3.0e-4
+  min_lr: 3.0e-5
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+  amp: true
+  device: auto
+  seed: 42
+  lr_schedule: wsd
+  wsd_decay_start: 0.8
+  ckpt_every: 200
+
+logging:
+  run_name: aria_v1_1b_multihost
+  checkpoint_dir: ./checkpoints/aria_v1_1b_multihost
+  log_every: 50

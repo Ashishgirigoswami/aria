@@ -1,0 +1,17 @@
+{
+  "n_params": 154470912,
+  "checkpoint": "checkpoints/aria_v1_160m_multihost/final.pt",
+  "num_fewshot": 0,
+  "tasks": {
+    "openbookqa": {
+      "acc,none": 0.164,
+      "acc_stderr,none": 0.016575811142446713,
+      "acc_norm,none": 0.278,
+      "acc_norm_stderr,none": 0.020055833888070914
+    },
+    "winogrande": {
+      "acc,none": 0.505130228887135,
+      "acc_stderr,none": 0.014051745961790513
+    }
+  }
+}

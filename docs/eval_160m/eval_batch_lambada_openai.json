@@ -1,0 +1,13 @@
+{
+  "n_params": 154470912,
+  "checkpoint": "checkpoints/aria_v1_160m_multihost/final.pt",
+  "num_fewshot": 0,
+  "tasks": {
+    "lambada_openai": {
+      "perplexity,none": 1008.0609660443417,
+      "perplexity_stderr,none": 57.72948895166928,
+      "acc,none": 0.14574034542984668,
+      "acc_stderr,none": 0.004915830705625075
+    }
+  }
+}

@@ -1,0 +1,59 @@
+## ARIA v1 160M — multi-host port of aria_v1_160m_fwe_500m.yaml
+## Same model + same training recipe, scaled to 16-chip v4-32 pod.
+##
+## Effective batch budget preserved:
+##   single-chip: batch=4, grad_accum=16   → eff=64
+##   16-chip:     batch=4, grad_accum=1, world=16  → eff=64 (identical)
+##
+## Same 30K steps, same 500M-token budget, just 16× faster wallclock.
+## ETA on v4-32: ~6-8h vs v6e-4's ~4.3d.
+
+model:
+  name: lsa
+  vocab_size: 50257
+  d_model: 768
+  n_layers: 15
+  n_heads: 12
+  d_head: 64
+  d_ff: 2200
+  d_kv_latent: 384
+  d_state: 192
+  max_seq_len: 256
+  dropout: 0.0
+  rope_base: 10000.0
+  tie_weights: true
+  interleave_ratio: 3
+  qk_norm: false
+
+data:
+  dataset: fineweb-edu
+  tokenizer: bpe
+  cache_dir: ./data
+  seq_len: 256
+  train_split: 0.99
+  max_train_tokens: 500000000
+
+training:
+  batch_size: 4                  # PER-CHIP (same as v6e-4 copy)
+  grad_accum_steps: 1            # world=16 * batch=4 = 64 effective (matches v6e-4 recipe)
+  max_steps: 30000
+  eval_every: 1000
+  eval_iters: 50
+  warmup_steps: 1000
+  lr: 6.0e-4
+  min_lr: 6.0e-5
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+  amp: true
+  device: auto
+  seed: 42
+  lr_schedule: wsd
+  wsd_decay_start: 0.8
+  ckpt_every: 200
+
+logging:
+  run_name: aria_v1_160m_multihost
+  checkpoint_dir: ./checkpoints/aria_v1_160m_multihost
+  log_every: 50
