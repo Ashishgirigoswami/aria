@@ -243,12 +243,99 @@ class ARIALMWrapper:
 
     @torch.no_grad()
     def loglikelihood_rolling(self, requests: list[str]) -> list[float]:
-        """Rolling log-likelihood over a full string (for LAMBADA, wikitext ppl)."""
+        """Rolling log-likelihood over a full string (for LAMBADA, wikitext ppl).
+
+        For texts longer than ``max_length``, evaluates via a sliding window
+        with stride = ``max_length // 2``: each position from 0 to len(ids)-1
+        is scored at most once, in a context that includes at least the
+        previous ``max_length // 2`` tokens. This matches the lm-eval-harness
+        reference semantics for rolling perplexity (see
+        EleutherAI/lm-evaluation-harness#huggingface_model.py).
+
+        Short texts (``len(ids) <= max_length``) are scored in a single
+        forward pass on all valid positions (tokens 1..n-1 predicted from
+        tokens 0..n-2).
+        """
         results: list[float] = []
         is_xla = HAS_XLA and str(self.device).startswith("xla")
         try:
             from tqdm import tqdm
             iterator = tqdm(requests, desc="loglikelihood_rolling", leave=False)
+        except ImportError:
+            iterator = requests
+
+        max_len = self.max_length
+        stride = max(1, max_len // 2)
+
+        for text in iterator:
+            ids = self.tok_encode(text)
+            if len(ids) < 2:
+                results.append(0.0)
+                continue
+            n_full = len(ids)
+
+            total_logp = 0.0
+            # Sliding window. For each window [start:start+max_len], we
+            # score targets from position `scored_up_to` (one past the last
+            # target already counted in the previous window) through
+            # window_end - 1, using context `ids[start : start+max_len-1]`.
+            start = 0
+            scored_up_to = 1  # targets are ids[1:], start scoring at pos 1
+
+            while True:
+                window_end = min(start + max_len, n_full)
+                # Positions in this window we still need to score.
+                score_from = max(scored_up_to, start + 1)
+                if score_from >= window_end:
+                    break
+                window_ids = ids[start:window_end]
+                n_win = len(window_ids)
+
+                if self.pad_to_max:
+                    padded = self._pad_ids(window_ids)
+                    input_ids = torch.tensor([padded[:-1]], device=self.device)
+                else:
+                    input_ids = torch.tensor([window_ids[:-1]], device=self.device)
+                logits, _ = self.model(input_ids)
+                if is_xla:
+                    torch_xla.sync()
+                logits_cpu = logits.float().cpu()
+
+                # Map absolute positions to window-local target indices.
+                tgt_start_local = score_from - start  # >= 1
+                tgt_end_local = n_win                  # exclusive
+                # input positions predicting these targets:
+                ctx_start = tgt_start_local - 1
+                ctx_end = tgt_end_local - 1
+                window_log_probs = torch.log_softmax(
+                    logits_cpu[0, ctx_start:ctx_end], dim=-1
+                )
+                window_targets = torch.tensor(
+                    ids[score_from:start + tgt_end_local], dtype=torch.long
+                )
+                gathered = window_log_probs.gather(
+                    -1, window_targets.unsqueeze(-1)
+                ).squeeze(-1)
+                total_logp += float(gathered.sum())
+
+                scored_up_to = start + tgt_end_local
+                if window_end >= n_full:
+                    break
+                start += stride
+
+            results.append(total_logp)
+        return results
+
+    @torch.no_grad()
+    def _loglikelihood_rolling_legacy(self, requests: list[str]) -> list[float]:
+        """Legacy truncating path — kept only so existing saved LAMBADA/ppl
+        JSONs can be regenerated bit-exact if needed. New code should call
+        ``loglikelihood_rolling`` above."""
+        results: list[float] = []
+        is_xla = HAS_XLA and str(self.device).startswith("xla")
+        try:
+            from tqdm import tqdm
+            iterator = tqdm(requests, desc="loglikelihood_rolling_legacy", leave=False)
         except ImportError:
             iterator = requests
 

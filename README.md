@@ -1,36 +1,72 @@
 # ARIA — Layered State Attention
 
-A hybrid attention + selective-state architecture trained from scratch on
-Google TPU Research Cloud, competitive with Pythia-160M on several 0-shot
-benchmarks despite training on **~600× less data**.
+A hybrid attention + selective-state 154M-parameter language model, trained
+from scratch on Google TPU Research Cloud free-tier. On 0-shot evaluations
+against Pythia-160M (same parameter scale, 600× more training data), ARIA
+shows **one clear win (ARC-Easy, +6pp), two within-error matches
+(ARC-Challenge, WinoGrande), and three clear trails (HellaSwag, PIQA,
+LAMBADA).**
 
 ![0-shot benchmark comparison](figures/eval_comparison_160m_vs_pythia.png)
 
 ## Headline result (0-shot, lm-eval-harness 0.4.11)
 
-| Task                     | Metric      | ARIA-131M  | **ARIA-160M**  | Pythia-160M | Random |
-|--------------------------|-------------|:----------:|:--------------:|:-----------:|:------:|
-| Training tokens          | —           | 50M wikitext | **500M FWE** | 300B Pile  | —      |
-| **ARC-Easy**             | acc         | 33.25%     | **45.62%** 🎯  | 39.5%       | 25%    |
-| **ARC-Easy**             | acc_norm    | 32.32%     | **41.20%**     | 37.7%       | 25%    |
-| PIQA                     | acc         | 53.37%     | **59.79%**     | 60.6%       | 50%    |
-| PIQA                     | acc_norm    | 49.18%     | **58.38%**     | 60.5%       | 50%    |
-| WinoGrande               | acc         | 48.46%     | **50.51%**     | 50.8%       | 50%    |
-| ARC-Challenge            | acc         | 18.60%     | **19.80%**     | 19.9%       | 25%    |
-| ARC-Challenge            | acc_norm    | 23.46%     | **24.40%**     | 25.3%       | 25%    |
-| HellaSwag                | acc_norm    | 26.62%     | **28.52%**     | 33.6%       | 25%    |
-| LAMBADA                  | acc         | 5.72%      | **14.57%**     | 37.3%       | 0%     |
-| LAMBADA                  | perplexity  | 8058       | **1008** (8× better) | 18   | —      |
-| OpenBookQA               | acc_norm    | —          | 27.80%         | 29.4%       | 25%    |
+| Task                     | Metric      | ARIA-131M  | **ARIA-160M**  | Pythia-160M | Δ to Pythia | Verdict |
+|--------------------------|-------------|:----------:|:--------------:|:-----------:|:-----------:|:-------:|
+| Training tokens          | —           | 50M wikitext | **500M FWE** | 300B Pile  | — | — |
+| **ARC-Easy**             | acc         | 33.25%     | **45.62%**     | 39.50%      | **+6.12pp** | ✅ WIN |
+| **ARC-Easy**             | acc_norm    | 32.32%     | **41.20%**     | 37.70%      | **+3.50pp** | ✅ WIN |
+| WinoGrande               | acc         | 48.46%     | **50.51%**     | 50.80%      | -0.29pp (±1.4) | ≈ MATCH |
+| ARC-Challenge            | acc         | 18.60%     | **19.80%**     | 19.90%      | -0.10pp (±1.2) | ≈ MATCH |
+| ARC-Challenge            | acc_norm    | 23.46%     | **24.40%**     | 25.30%      | -0.90pp (±1.3) | ≈ MATCH |
+| OpenBookQA               | acc         | —          | 16.40%         | 16.80%      | -0.40pp (±1.7) | ≈ MATCH |
+| PIQA                     | acc         | 53.37%     | **59.79%**     | 60.60%      | -0.81pp (±1.1) | ⚠ trails slightly |
+| PIQA                     | acc_norm    | 49.18%     | **58.38%**     | 60.50%      | -2.12pp (±1.2) | ❌ trails |
+| OpenBookQA               | acc_norm    | —          | 27.80%         | 29.40%      | -1.60pp (±2.0) | ⚠ trails slightly |
+| HellaSwag                | acc         | 26.23%     | **27.63%**     | 28.50%      | -0.87pp (±0.4) | ❌ trails |
+| HellaSwag                | acc_norm    | 26.62%     | **28.52%**     | 33.60%      | **-5.08pp**  | ❌ trails |
+| LAMBADA                  | acc         | 5.72%      | **14.57%**     | 37.30%      | **-22.73pp** | ❌ trails (data-limited) |
+| LAMBADA                  | perplexity  | 8058       | **1008** (8× better than 131M)* | **18** | 56× worse | ❌ trails (*see caveat) |
 
-**ARIA-160M beats Pythia-160M on ARC-Easy** (+6.1pp acc, +3.5pp acc_norm) and
-matches within-error on ARC-Challenge, PIQA, and WinoGrande — while training
-on **600× fewer tokens** (500M FineWeb-Edu vs 300B Pile). HellaSwag and
-LAMBADA still trail because those benchmarks are data-hungry enough that
-500M tokens isn't enough regardless of architecture.
+`± value` = 1 standard error of the difference (Welch). "MATCH" = within
+±2 standard errors; "WIN" / "trails" = reliably different.
+
+**What the numbers do and don't say:**
+- ✅ ARC-Easy is a **genuine win** — +6pp at 600× less training data is real.
+- ≈ ARC-Challenge, WinoGrande, OpenBookQA (acc) are **within statistical error**
+  of Pythia. Not a "win," not a "loss."
+- ❌ HellaSwag acc_norm (-5pp), PIQA acc_norm (-2pp), LAMBADA (22pp / 56× ppl)
+  are **real gaps**. These are the data-hungry benchmarks (story completion,
+  narrative coherence) where 500M tokens is demonstrably not enough.
+- ⚠ **LAMBADA caveat**: the current `loglikelihood_rolling` in
+  [`scripts/eval_harness.py`](./scripts/eval_harness.py) truncates inputs to
+  `max_length=256` instead of doing proper sliding-window scoring. LAMBADA
+  samples average ~70 tokens so truncation rarely bites there, but the
+  perplexity number should be treated as indicative, not authoritative,
+  until the wrapper is fixed. See [issue tracker](#known-issues) below.
 
 Raw eval JSONs: [`docs/eval_160m/`](./docs/eval_160m/).
 Per-task headline metric plotted above; dotted lines = random baseline.
+
+## Provenance (what artifact → what claim)
+
+Every number in the headline table maps to exactly one (checkpoint, config,
+eval JSON, date) tuple:
+
+| Model          | Checkpoint                              | Config                                      | Eval JSON                              | Date       |
+|----------------|-----------------------------------------|---------------------------------------------|----------------------------------------|------------|
+| ARIA-131M      | `aria_v1_150m_t256/best.pt` (TPU v6e-4) | `configs/aria_v1_150m_t256.yaml`            | `runs/.../eval_v1_131m.json`           | 2026-04-18 |
+| ARIA-160M      | `aria_v1_160m_multihost/final.pt` (v4-32 SPMD) | `configs/aria_v1_160m_multihost.yaml` | `docs/eval_160m/eval_batch_*.json` + `eval_winogrande_openbookqa.json` | 2026-04-19 |
+| Pythia-160M    | `EleutherAI/pythia-160m` (public)       | — (from HF model card)                      | EleutherAI published leaderboard       | 2023       |
+
+Note: an earlier document ([`docs/TRAINING_RESULTS_131M.md`](./docs/TRAINING_RESULTS_131M.md))
+reports **val_ppl 29.01, elapsed 82,771s** for the ORIGINAL 131M run on
+TPU v6e-4 (2026-04-17). The later ARIA-131M reproducibility run on TPU v4-8
+(`ckpts-pulled/aria_v1_131m_repro/summary.json`) reports **val_ppl 29.37,
+elapsed 155,982s** — a separate, independent 2026-04-18 run that confirmed
+the original within ~1% ppl on different hardware. Both are intentional; the
+repro run is documented separately to demonstrate reproducibility across
+TPU generations, not to replace the original result.
 
 ## Training curves
 
@@ -59,7 +95,8 @@ single fused operation:
 
 Two novelty claims (independently verified against arXiv + Google Scholar +
 Semantic Scholar + patents): shared-latent-drives-both-paths and
-joint-softmax-fusion. See [`docs/ARIA_ARCHITECTURE_GUIDE.md`](./docs/ARIA_ARCHITECTURE_GUIDE.md).
+joint-softmax-fusion. Deeper architecture notes:
+[`aria/lsa.py`](./aria/lsa.py) (authoritative reference implementation).
 
 Block ratio: 3:1 LSA:full-attention interleave (per Qwen3-Next validation).
 Effective long-range memory per token: `O(W + d_state)` instead of `O(N)`.
@@ -117,8 +154,10 @@ python scripts/eval_harness.py \
 ## What this is (and isn't)
 
 - ✅ **A working 154M-parameter hybrid LM**, trained from scratch on 500M
-  FineWeb-Edu tokens, matching or beating Pythia-160M on 4 of 7 standard
-  0-shot benchmarks despite training on 600× fewer tokens.
+  FineWeb-Edu tokens, beating Pythia-160M on **1 of 7** benchmarks (ARC-Easy,
+  +6pp) and within statistical error on **3 more** (ARC-Challenge,
+  WinoGrande, OpenBookQA acc), while trailing clearly on the data-hungry
+  ones (HellaSwag, PIQA, LAMBADA).
 - ✅ **Architectural novelty**: shared MLA latent driving both KV path and
   SSM input stream; joint softmax fusion over local KV and virtual state
   token. Both claims independently verified against prior work.
@@ -196,6 +235,24 @@ python scripts/eval_harness.py \
   note   = {CargoHive Technologies. https://github.com/Ashishgirigoswami/aria},
 }
 ```
+
+## Known issues
+
+- **`loglikelihood_rolling` truncates instead of sliding.** The current eval
+  wrapper ([`scripts/eval_harness.py`](./scripts/eval_harness.py)) scores
+  only `ids[:max_length]` of each document rather than doing proper
+  sliding-window scoring across the full sequence. Affects any benchmark
+  whose metric passes through `loglikelihood_rolling` — specifically
+  WikiText perplexity, and LAMBADA documents longer than 256 tokens
+  (LAMBADA averages ~70 tokens so the 1008 ppl number is probably not
+  materially wrong, but it isn't strictly rigorous). A sliding-window
+  rewrite is on the backlog; until then, treat LAMBADA ppl as indicative
+  not authoritative. All accuracy-based benchmarks (loglikelihood of
+  short continuations, scored on full short inputs) are unaffected.
+- **No HuggingFace Hub upload yet.** Model weights + config + card are
+  staged at `ckpts-pulled/aria_v1_160m_multihost/`; Hub push is next.
+- **No instruction tuning.** All reported numbers are base-model 0-shot.
+  SFT/DPO on Tulu-3 + UltraFeedback is the planned follow-up.
 
 ## License
 
