@@ -249,7 +249,10 @@ class Trainer:
         history = {"train_loss": [], "val_loss": [], "val_ppl": [], "step": []}
         t0 = time.time()
 
-        pbar = tqdm(range(self.cfg.max_steps), desc=self.cfg.run_name)
+        # If we resumed, self.step is already > 0 — iterate only the
+        # remaining budget so final.pt lands at exactly max_steps.
+        pbar = tqdm(range(self.step, self.cfg.max_steps), desc=self.cfg.run_name,
+                    initial=self.step, total=self.cfg.max_steps)
         for _ in pbar:
             self._apply_seesaw()
             loss = self.train_step()
