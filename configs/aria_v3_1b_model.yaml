@@ -1,0 +1,21 @@
+model:
+  name: lsa
+  vocab_size: 50304
+  d_model: 2048
+  n_layers: 20
+  n_heads: 16
+  n_kv_heads: 4
+  d_head: 128
+  d_ff: 5632
+  d_kv_latent: 512
+  d_state: 256
+  max_seq_len: 2048
+  dropout: 0.0
+  rope_base: 500000.0
+  tie_weights: true
+  norm_eps: 1.0e-6
+  window_size: 1024
+  full_attention_layers: [3, 6, 9, 12, 15, 18]
+  qk_norm: true
+  ssm_block: v2
+  gradient_checkpointing: true

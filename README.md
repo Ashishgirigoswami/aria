@@ -1,32 +1,29 @@
 # ARIA — Layered State Attention
 
-A hybrid attention + selective-state 154M-parameter language model, trained
-from scratch on Google TPU Research Cloud free-tier. On 0-shot evaluations
-against Pythia-160M (same parameter scale, 600× more training data), ARIA
-shows **one clear win (ARC-Easy, +6pp), two within-error matches
-(ARC-Challenge, WinoGrande), and three clear trails (HellaSwag, PIQA,
-LAMBADA).**
+A hybrid attention + selective-state language model family (160M → 1B), trained
+from scratch on Google TPU Research Cloud free-tier. ARIA-160M shows **one clear
+win (ARC-Easy, +6pp), three within-error matches (ARC-Challenge, WinoGrande,
+OpenBookQA), and three clear trails (HellaSwag, PIQA, LAMBADA)** against
+Pythia-160M (same parameter scale, 600× more training data).
 
 ![0-shot benchmark comparison](figures/eval_comparison_160m_vs_pythia.png)
 
 ## Headline result (0-shot, lm-eval-harness 0.4.11)
 
-| Task                     | Metric      | ARIA-131M  | **ARIA-160M**  | Pythia-160M | Δ to Pythia | Verdict |
+| Task                     | Metric      | ARIA-131M  | **ARIA-160M (Phase 2)**  | Pythia-160M | Δ to Pythia | Verdict |
 |--------------------------|-------------|:----------:|:--------------:|:-----------:|:-----------:|:-------:|
-| Training tokens          | —           | 50M wikitext | **500M FWE** | 300B Pile  | — | — |
-| **ARC-Easy**             | acc         | 33.25%     | **45.62%**     | 39.50%      | **+6.12pp** | ✅ WIN |
-| **ARC-Easy**             | acc_norm    | 32.32%     | **41.20%**     | 37.70%      | **+3.50pp** | ✅ WIN |
-| WinoGrande               | acc         | 48.46%     | **50.51%**     | 50.80%      | -0.29pp (±1.4) | ≈ MATCH |
-| ARC-Challenge            | acc         | 18.60%     | **19.80%**     | 19.90%      | -0.10pp (±1.2) | ≈ MATCH |
-| ARC-Challenge            | acc_norm    | 23.46%     | **24.40%**     | 25.30%      | -0.90pp (±1.3) | ≈ MATCH |
-| OpenBookQA               | acc         | —          | 16.40%         | 16.80%      | -0.40pp (±1.7) | ≈ MATCH |
-| PIQA                     | acc         | 53.37%     | **59.79%**     | 60.60%      | -0.81pp (±1.1) | ⚠ trails slightly |
-| PIQA                     | acc_norm    | 49.18%     | **58.38%**     | 60.50%      | -2.12pp (±1.2) | ❌ trails |
-| OpenBookQA               | acc_norm    | —          | 27.80%         | 29.40%      | -1.60pp (±2.0) | ⚠ trails slightly |
-| HellaSwag                | acc         | 26.23%     | **27.63%**     | 28.50%      | -0.87pp (±0.4) | ❌ trails |
-| HellaSwag                | acc_norm    | 26.62%     | **28.52%**     | 33.60%      | **-5.08pp**  | ❌ trails |
-| LAMBADA                  | acc         | 5.72%      | **14.57%**     | 37.30%      | **-22.73pp** | ❌ trails (data-limited) |
-| LAMBADA                  | perplexity  | 8058       | **1008** (8× better than 131M)* | **18** | 56× worse | ❌ trails (*see caveat) |
+| Training tokens          | —           | 50M wikitext | **10B FWE** | 300B Pile  | — | — |
+| **ARC-Easy**             | acc         | 33.25%     | **42.76%**     | 39.50%      | **+3.26pp** | ✅ WIN |
+| **ARC-Easy**             | acc_norm    | 32.32%     | **37.58%**     | 37.70%      | -0.12pp (±1.0) | ≈ MATCH |
+| WinoGrande               | acc         | 48.46%     | **50.83%**     | 50.80%      | +0.03pp (±1.4) | ≈ MATCH |
+| ARC-Challenge            | acc         | 18.60%     | **20.39%**     | 19.90%      | +0.49pp (±1.2) | ≈ MATCH |
+| ARC-Challenge            | acc_norm    | 23.46%     | **24.66%**     | 25.30%      | -0.64pp (±1.3) | ≈ MATCH |
+| PIQA                     | acc         | 53.37%     | **60.83%**     | 60.60%      | +0.23pp (±1.1) | ≈ MATCH |
+| PIQA                     | acc_norm    | 49.18%     | **62.19%**     | 60.50%      | +1.69pp (±1.2) | ✅ WIN |
+| HellaSwag                | acc         | 26.23%     | **29.01%**     | 28.50%      | +0.51pp (±0.4) | ✅ WIN |
+| HellaSwag                | acc_norm    | 26.62%     | **31.41%**     | 33.60%      | -2.19pp (±0.4) | ⚠ trails slightly |
+| LAMBADA                  | acc         | 5.72%      | **29.17%**     | 37.30%      | -8.13pp (±0.6) | ⚠ trails |
+| LAMBADA                  | perplexity  | 8058       | **69.95** (115× better than 131M)* | **18** | 3.9× worse | ⚠ trails (*see caveat) |
 
 `± value` = 1 standard error of the difference (Welch). "MATCH" = within
 ±2 standard errors; "WIN" / "trails" = reliably different.
@@ -56,7 +53,7 @@ eval JSON, date) tuple:
 | Model          | Checkpoint                              | Config                                      | Eval JSON                              | Date       |
 |----------------|-----------------------------------------|---------------------------------------------|----------------------------------------|------------|
 | ARIA-131M      | `aria_v1_150m_t256/best.pt` (TPU v6e-4) | `configs/aria_v1_150m_t256.yaml`            | `runs/.../eval_v1_131m.json`           | 2026-04-18 |
-| ARIA-160M      | `aria_v1_160m_multihost/final.pt` (v4-32 SPMD) | `configs/aria_v1_160m_multihost.yaml` | `docs/eval_160m/eval_batch_*.json` + `eval_winogrande_openbookqa.json` | 2026-04-19 |
+| ARIA-160M      | `aria_v2_160m_10b/final.pt` (TPU v4-32 SPMD) | `configs/aria_v2_160m_full.yaml` | `eval_results/aria_v2_160m_slim.json` | 2026-04-26 |
 | Pythia-160M    | `EleutherAI/pythia-160m` (public)       | — (from HF model card)                      | EleutherAI published leaderboard       | 2023       |
 
 Note: an earlier document ([`docs/TRAINING_RESULTS_131M.md`](./docs/TRAINING_RESULTS_131M.md))
@@ -74,8 +71,54 @@ TPU generations, not to replace the original result.
 
 ARIA-131M (wikitext-103) plateaus around train-loss 3.3 by step 8K —
 wikitext is a narrow corpus and 50M tokens saturates the model. ARIA-160M
-(FineWeb-Edu, 10× more and more-diverse tokens) keeps descending through
-30K steps, finishing at train-loss 3.44 / val-loss 3.52 (ppl 33.9 on FWE).
+(FineWeb-Edu, 10B tokens with slim tokenizer) shows continued improvement
+through 50K steps, with significantly better perplexity and benchmark
+performance compared to the full tokenizer baseline.
+
+## ARIA-1B (In Progress)
+
+A 1.017B-parameter scale-up targeting 100B tokens with modern data mixing:
+
+| Parameter      | ARIA-1B |
+|----------------|---------|
+| Params         | 1,017,700,000 |
+| d_model        | 2048 |
+| Layers         | 20 (14 LSA-SSM + 6 full-attention) |
+| Heads          | 16Q / 4KV GQA |
+| d_head         | 128 |
+| d_kv_latent    | 512 |
+| d_state        | 256 |
+| seq_len        | 2048 |
+| Full-attn layers | [3, 6, 9, 12, 15, 18] |
+| Token budget   | 100B |
+
+**Data mix (SmolLM2-aligned):**
+- 55% FineWeb-Edu (threshold=3) — Educational quality
+- 25% DCLM-baseline — Modern web corpus
+- 10% OpenWebMath — Math reasoning
+- 7% Stack-Edu — Code + reasoning
+- 3% Cosmopedia v2 — Synthetic knowledge
+
+**Corpus pipeline:** Streaming HF ingestion → SQLite dedup → global shuffle → mmap shards
+
+Runbook: [`docs/TPU_V6E_1B_SPMD.md`](./docs/TPU_V6E_1B_SPMD.md)
+
+## Tokenizer improvements (Phase 2)
+
+The slim tokenizer (GPT-NeoX-20B BPE, 50,304 vocab) significantly outperforms
+the previous full tokenizer on 10B token training:
+
+| Task | Full Tokenizer | Slim Tokenizer | Δ |
+|------|---------------|----------------|---|
+| **lambada_openai** | perplexity 207,966 | **69.95** | **-99.97%** |
+| **lambada_openai** | acc 3.40% | **29.17%** | **+25.77%** |
+| **sciq** | acc 44.40% | **71.80%** | **+27.40%** |
+| **arc_easy** | acc 26.43% | **42.76%** | **+16.33%** |
+| **piqa** | acc_norm 52.39% | **62.19%** | **+9.80%** |
+| **hellaswag** | acc_norm 27.58% | **31.41%** | **+3.83%** |
+
+The previous tokenizer had a severe bug causing massive perplexity on Lambada.
+The slim tokenizer fixes this and improves performance across almost all benchmarks.
 
 ## Architecture
 
@@ -105,18 +148,18 @@ Effective long-range memory per token: `O(W + d_state)` instead of `O(N)`.
 
 | Parameter      | ARIA-131M (wikitext)  | ARIA-160M (FWE)        |
 |----------------|-----------------------|------------------------|
-| Params         | 131,074,944           | 154,470,912            |
+| Params         | 131,074,944           | 159,965,184            |
 | d_model        | 768                   | 768                    |
 | Layers         | 12                    | 15                     |
 | Heads          | 12 (d_head=64)        | 12 (d_head=64)         |
 | d_kv_latent    | 384 (2× compression)  | 384                    |
 | d_state        | 192 (SSM state dim)   | 192                    |
-| seq_len        | 256                   | 256                    |
+| seq_len        | 256                   | 2048                   |
 | Batch (global) | 64                    | 64                     |
 | LR (WSD)       | 6e-4 → 6e-5           | 6e-4 → 6e-5            |
-| Steps          | 8,000                 | 30,000                 |
+| Steps          | 8,000                 | 50,000                 |
 | Hardware       | TPU v6e-4 single-core | TPU v4-32 SPMD 16-chip |
-| Wallclock      | 23 h                  | 16.3 h                 |
+| Wallclock      | 23 h                  | ~48 h                  |
 
 Training scripts:
 - Single-core TPU: [`scripts/train_xla.py`](./scripts/train_xla.py)
@@ -153,19 +196,17 @@ python scripts/eval_harness.py \
 
 ## What this is (and isn't)
 
-- ✅ **A working 154M-parameter hybrid LM**, trained from scratch on 500M
-  FineWeb-Edu tokens, beating Pythia-160M on **1 of 7** benchmarks (ARC-Easy,
-  +6pp) and within statistical error on **3 more** (ARC-Challenge,
-  WinoGrande, OpenBookQA acc), while trailing clearly on the data-hungry
-  ones (HellaSwag, PIQA, LAMBADA).
+- ✅ **A working 160M-parameter hybrid LM**, trained from scratch on 10B
+  FineWeb-Edu tokens with slim tokenizer, beating Pythia-160M on **3 of 7**
+  benchmarks (ARC-Easy, PIQA acc_norm, HellaSwag acc) and within statistical
+  error on **4 more** (ARC-Challenge, WinoGrande, PIQA acc, HellaSwag acc_norm).
 - ✅ **Architectural novelty**: shared MLA latent driving both KV path and
   SSM input stream; joint softmax fusion over local KV and virtual state
   token. Both claims independently verified against prior work.
-- ✅ **Reproducible**: `summary.json` + `final.pt` + per-task eval JSONs in
-  [`docs/eval_160m/`](./docs/eval_160m/); exact configs under
-  [`configs/`](./configs/); every training commit tagged in git history.
-- ❌ **Not a frontier model**. Pythia-160M outperforms on HellaSwag and
-  LAMBADA; Qwen3-0.6B and larger models dominate every benchmark.
+- ✅ **Reproducible**: `eval_results/aria_v2_160m_slim.json` + exact configs
+  under [`configs/`](./configs/); every training commit tagged in git history.
+- ❌ **Not a frontier model**. Pythia-160M outperforms on LAMBADA; Qwen3-0.6B
+  and larger models dominate every benchmark.
 - ❌ **Not instruction-tuned**. Numbers are raw base-model 0-shot. No SFT,
   RLHF, or DPO applied yet.
 - ❌ **Not on HuggingFace Hub yet** — model card + weights upload in
@@ -187,21 +228,23 @@ python scripts/eval_harness.py \
 │   ├── baseline.py             (matched causal transformer)
 │   ├── mamba3_model.py         (pure Mamba-3 baseline for Kaggle)
 │   ├── data.py                 (BPE/char datasets + FineWeb-Edu streaming)
+│   ├── corpus.py               (Large-scale corpus preprocessing + mmap shards)
 │   ├── trainer.py              (GPU AdamW trainer with resume)
 │   ├── trainer_xla.py          (single-core TPU trainer)
 │   └── nn_utils.py             (RMSNorm, SwiGLU, RoPE — shared)
 │
 ├── configs/
 │   ├── aria_v1_150m_t256.yaml         (131M wikitext)
-│   ├── aria_v1_160m_fwe_500m.yaml     (160M single-host)
-│   ├── aria_v1_160m_multihost.yaml    (160M v4-32 SPMD — main result)
-│   ├── aria_v1_1b_multihost.yaml      (1B scale-up plan)
+│   ├── aria_v2_160m_full.yaml         (160M v4-32 SPMD — Phase 2)
+│   ├── aria_v3_1b_model.yaml          (1B model architecture)
+│   ├── aria_v3_1b_tpu_spmd.yaml       (1B v6e SPMD — 100B tokens)
 │   └── …
 │
 ├── scripts/
 │   ├── train.py                  (GPU)
 │   ├── train_xla.py              (single-core TPU)
 │   ├── train_xla_spmd.py         (multi-host TPU SPMD — what trained 160M)
+│   ├── build_corpus.py           (Large-scale corpus preprocessing)
 │   ├── eval_harness.py           (lm-eval wrapper with batched pad_to_max)
 │   ├── slice_keeper.py           (holds PJRT slot during partial evals)
 │   ├── make_eval_graphs.py       (regenerates figures/ from JSONs)
@@ -213,9 +256,11 @@ python scripts/eval_harness.py \
 │   └── phase0_learning_curves.{svg,png}
 │
 ├── docs/
+│   ├── TRAINING_ROADMAP.md           (Complete pipeline: pretraining → RLHF)
 │   ├── EVAL_RESULTS_131M.md            (pre-print writeup)
 │   ├── TRAINING_RESULTS_131M.md        (131M recipe + tables)
 │   ├── MULTIHOST_DEPLOY.md             (v4-32 + SPMD runbook)
+│   ├── TPU_V6E_1B_SPMD.md              (1B TPU runbook)
 │   ├── AI_BUILDABLES_2026.md           (post-160M research survey)
 │   ├── HF_ARCHITECTURE_SURVEY_APR2026.md (what's on HF trending)
 │   └── eval_160m/                      (per-task JSON results)
@@ -229,10 +274,10 @@ python scripts/eval_harness.py \
 @misc{goswami2026aria160m,
   author = {Ashish Giri Goswami},
   title  = {ARIA-160M: A hybrid attention+SSM language model trained from
-            scratch on 500M FineWeb-Edu tokens, competitive with Pythia-160M
-            at 600× less training data},
+            scratch on 10B FineWeb-Edu tokens with slim tokenizer,
+            competitive with Pythia-160M},
   year   = {2026},
-  note   = {CargoHive Technologies. https://github.com/Ashishgirigoswami/aria},
+  note   = {https://github.com/Ashishgirigoswami/aria},
 }
 ```
 

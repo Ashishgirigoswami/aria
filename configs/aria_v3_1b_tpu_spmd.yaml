@@ -1,0 +1,121 @@
+model:
+  name: lsa
+  vocab_size: 50304
+  d_model: 2048
+  n_layers: 20
+  n_heads: 16
+  n_kv_heads: 4
+  d_head: 128
+  d_ff: 5632
+  d_kv_latent: 512
+  d_state: 256
+  max_seq_len: 2048
+  dropout: 0.0
+  rope_base: 500000.0
+  tie_weights: true
+  norm_eps: 1.0e-6
+  window_size: 1024
+  full_attention_layers: [3, 6, 9, 12, 15, 18]
+  qk_norm: true
+  ssm_block: v2
+  gradient_checkpointing: true
+
+data:
+  tokenizer: neox
+  seq_len: 2048
+  cache_dir: ./data
+  output_dir: ./data/aria_1b_100b
+  manifest_path: ./data/aria_1b_100b/manifest.json
+  token_budget: 100000000000
+  val_tokens: 100000000
+  sources:
+    - name: fineweb_edu
+      repo_id: HuggingFaceFW/fineweb-edu
+      subset: sample-350BT
+      split: train
+      weight: 0.55
+      text_fields: [text]
+      min_chars: 64
+    - name: dclm
+      repo_id: mlfoundations/dclm-baseline-1.0
+      split: train
+      weight: 0.25
+      text_fields: [text]
+      min_chars: 64
+    - name: openwebmath
+      repo_id: open-web-math/open-web-math
+      split: train
+      weight: 0.10
+      text_fields: [text]
+      min_chars: 64
+    - name: stack_edu
+      repo_id: HuggingFaceTB/stack-edu
+      split: train
+      weight: 0.07
+      text_fields: [text]
+      min_chars: 64
+    - name: cosmopedia
+      repo_id: HuggingFaceTB/cosmopedia-v2
+      split: train
+      weight: 0.03
+      text_fields: [text]
+      min_chars: 64
+  build:
+    dedupe: true
+    dedupe_db: ./data/aria_1b_100b/dedupe.sqlite
+    shuffle_buffer_docs: 16384
+    shard_tokens: 268435456
+    train_tokens: 100000000000
+    val_tokens: 100000000
+    dtype: uint16
+
+training:
+  optimizer: adamw
+  lr: 3.0e-4
+  min_lr: 3.0e-5
+  beta1: 0.9
+  beta2: 0.95
+  weight_decay: 0.1
+  warmup_steps: 8000
+  stable_steps: 48000
+  lr_schedule: warmup_stable_cosine
+  batch_size: 2
+  grad_accum_steps: 4
+  token_budget: 100000000000
+  max_steps: 0
+  eval_every: 2000
+  eval_iters: 40
+  ckpt_every: 200
+  checkpoint_interval_minutes: 10
+  grad_clip: 1.0
+  amp: true
+  device: auto
+  seed: 42
+
+checkpointing:
+  push_to_gcs: true
+  gcs_bucket: gs://aria-trc-ckpts-us-east1/aria_v3_1b_tpu_spmd
+  latest_weights_only: true
+  best_weights_only: false
+  final_weights_only: false
+
+evaluation:
+  enabled: true
+  every_tokens: 2500000000
+  tasks:
+    - arc_easy
+    - arc_challenge
+    - hellaswag
+    - piqa
+    - winogrande
+    - lambada_openai
+  device: xla
+  max_length: 2048
+  batch_size: 2
+  pad_to_max: true
+  output_dir: ./eval_results
+
+logging:
+  run_name: aria_v3_1b_tpu_spmd
+  checkpoint_dir: ./checkpoints/aria_v3_1b_tpu_spmd
+  log_every: 20
